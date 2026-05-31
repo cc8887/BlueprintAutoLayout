@@ -1,0 +1,53 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0.0",
+  "FriendlyName": "Blueprint Auto Layout",
+  "Description": "Automatically arrange nodes in any Blueprint graph (Logic, Material, Animation) with constraint-aware, collision-free, compact layout.",
+  "Category": "Editor",
+  "CreatedBy": "ccc887",
+  "CreatedByURL": "",
+  "DocsURL": "",
+  "MarketplaceURL": "",
+  "SupportURL": "",
+  "CanContainContent": false,
+  "IsBetaVersion": false,
+  "IsExperimentalVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "BlueprintAutoLayout",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "WhitelistPlatforms": [
+        "Win64",
+        "Mac",
+        "Linux"
+      ]
+    },
+    {
+      "Name": "BlueprintAutoLayoutTests",
+      "Type": "Editor",
+      "LoadingPhase": "Default",
+      "WhitelistPlatforms": [
+        "Win64",
+        "Mac",
+        "Linux"
+      ]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "BlueprintLisp",
+      "Enabled": true
+    },
+    {
+      "Name": "AnimBP2FP",
+      "Enabled": true
+    },
+    {
+      "Name": "MatBP2FP",
+      "Enabled": true
+    }
+  ]
+}

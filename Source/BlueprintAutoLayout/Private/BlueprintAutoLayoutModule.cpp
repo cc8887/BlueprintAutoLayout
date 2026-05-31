@@ -1,0 +1,505 @@
+// BlueprintAutoLayoutModule.cpp
+// Copyright (c) 2026 ccc887. All Rights Reserved.
+
+#include "BlueprintAutoLayoutModule.h"
+#include "BlueprintAutoLayoutEngine.h"
+#include "BALConstraintCollector.h"
+
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
+
+#include "Framework/Commands/Commands.h"
+#include "Framework/Commands/UICommandList.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "Framework/Application/SlateApplication.h"
+
+#include "ToolMenus.h"
+#include "ToolMenuContext.h"
+
+#include "GraphEditor.h"
+#include "EditorSubsystem.h"
+#include "Subsystems/AssetEditorSubsystem.h"
+#include "Editor.h"
+
+#include "BlueprintEditor.h"
+#include "BlueprintEditorModule.h"
+
+#include "IMaterialEditor.h"
+#include "MaterialGraph/MaterialGraph.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialFunction.h"
+
+#include "Misc/MessageDialog.h"
+#include "Styling/AppStyle.h"
+#include "UObject/UObjectIterator.h"
+#include "UObject/UObjectHash.h"
+
+#define LOCTEXT_NAMESPACE "BlueprintAutoLayout"
+
+namespace
+{
+	const FName AutoLayoutBehaviorName(TEXT("AutoLayout"));
+	constexpr int32 AutoLayoutEarlyPriority = 100;
+
+	TSet<UEdGraphNode*> CollectChangedGraphNodes(const TArray<BlueprintLispImportLifecycle::FImportNodeChange>& Changes)
+	{
+		TSet<UEdGraphNode*> Nodes;
+		for (const BlueprintLispImportLifecycle::FImportNodeChange& Change : Changes)
+		{
+			if (Change.Node)
+			{
+				Nodes.Add(Change.Node);
+			}
+		}
+		return Nodes;
+	}
+
+	TSet<UEdGraphNode*> CollectChangedGraphNodes(const TArray<AnimBP2FPImportLifecycle::FImportNodeChange>& Changes)
+	{
+		TSet<UEdGraphNode*> Nodes;
+		for (const AnimBP2FPImportLifecycle::FImportNodeChange& Change : Changes)
+		{
+			if (Change.Node)
+			{
+				Nodes.Add(Change.Node);
+			}
+		}
+		return Nodes;
+	}
+
+	TSet<UEdGraphNode*> CollectChangedGraphNodes(const TArray<MatBP2FPImportLifecycle::FImportNodeChange>& Changes)
+	{
+		TSet<UEdGraphNode*> Nodes;
+		for (const MatBP2FPImportLifecycle::FImportNodeChange& Change : Changes)
+		{
+			if (Change.Node)
+			{
+				Nodes.Add(Change.Node);
+			}
+		}
+		return Nodes;
+	}
+
+	template <typename ContextType>
+	void RunGraphLayout(const ContextType& Context, const TSet<UEdGraphNode*>& ChangedNodes)
+	{
+		if (!Context.TargetGraph)
+		{
+			return;
+		}
+		if (!Context.RequestedBehaviors.Contains(AutoLayoutBehaviorName))
+		{
+			return;
+		}
+		if (ChangedNodes.IsEmpty())
+		{
+			FBlueprintAutoLayoutEngine::Layout(Context.TargetGraph);
+			return;
+		}
+		FBlueprintAutoLayoutEngine::LayoutSelection(Context.TargetGraph, ChangedNodes);
+	}
+
+	class FBlueprintLispAutoLayoutHook : public BlueprintLispImportLifecycle::IImportLifecycleHook
+	{
+	public:
+		virtual int32 GetPriority(BlueprintLispImportLifecycle::EImportLifecyclePhase Phase) const override
+		{
+			return Phase == BlueprintLispImportLifecycle::EImportLifecyclePhase::PostNodeChanges ? AutoLayoutEarlyPriority : 0;
+		}
+
+		virtual void OnNodePhase(const BlueprintLispImportLifecycle::FImportNodePhaseEvent& Event) override
+		{
+			if (Event.Phase != BlueprintLispImportLifecycle::EImportLifecyclePhase::PostNodeChanges)
+			{
+				return;
+			}
+			RunGraphLayout(Event.Context, CollectChangedGraphNodes(Event.Changes));
+		}
+	};
+
+	class FAnimBP2FPAutoLayoutHook : public AnimBP2FPImportLifecycle::IImportLifecycleHook
+	{
+	public:
+		virtual int32 GetPriority(AnimBP2FPImportLifecycle::EImportLifecyclePhase Phase) const override
+		{
+			return Phase == AnimBP2FPImportLifecycle::EImportLifecyclePhase::PostNodeChanges ? AutoLayoutEarlyPriority : 0;
+		}
+
+		virtual void OnNodePhase(const AnimBP2FPImportLifecycle::FImportNodePhaseEvent& Event) override
+		{
+			if (Event.Phase != AnimBP2FPImportLifecycle::EImportLifecyclePhase::PostNodeChanges)
+			{
+				return;
+			}
+			RunGraphLayout(Event.Context, CollectChangedGraphNodes(Event.Changes));
+		}
+	};
+
+	class FMatBP2FPAutoLayoutHook : public MatBP2FPImportLifecycle::IImportLifecycleHook
+	{
+	public:
+		virtual int32 GetPriority(MatBP2FPImportLifecycle::EImportLifecyclePhase Phase) const override
+		{
+			return Phase == MatBP2FPImportLifecycle::EImportLifecyclePhase::PostNodeChanges ? AutoLayoutEarlyPriority : 0;
+		}
+
+		virtual void OnNodePhase(const MatBP2FPImportLifecycle::FImportNodePhaseEvent& Event) override
+		{
+			if (Event.Phase != MatBP2FPImportLifecycle::EImportLifecyclePhase::PostNodeChanges)
+			{
+				return;
+			}
+			RunGraphLayout(Event.Context, CollectChangedGraphNodes(Event.Changes));
+		}
+	};
+}
+
+struct FBlueprintAutoLayoutModule::FHookRegistrationState
+{
+	TSharedPtr<FBlueprintLispAutoLayoutHook> BlueprintLispHook;
+	BlueprintLispImportLifecycle::FImportLifecycleHookHandle BlueprintLispHandle;
+	TSharedPtr<FAnimBP2FPAutoLayoutHook> AnimBP2FPHook;
+	AnimBP2FPImportLifecycle::FImportLifecycleHookHandle AnimBP2FPHandle;
+	TSharedPtr<FMatBP2FPAutoLayoutHook> MatBP2FPHook;
+	MatBP2FPImportLifecycle::FImportLifecycleHookHandle MatBP2FPHandle;
+};
+
+FBALCommands::FBALCommands()
+	: TCommands<FBALCommands>(
+		TEXT("BlueprintAutoLayout"),
+		LOCTEXT("BlueprintAutoLayout", "Blueprint Auto Layout"),
+		NAME_None,
+		FAppStyle::GetAppStyleSetName())
+{}
+
+void FBALCommands::RegisterCommands()
+{
+	UI_COMMAND(LayoutGraph,
+		"Auto Layout Graph",
+		"Automatically arrange all nodes in the current graph",
+		EUserInterfaceActionType::Button,
+		FInputChord(EModifierKey::Control | EModifierKey::Shift, EKeys::L));
+
+	UI_COMMAND(LayoutSelection,
+		"Auto Layout Selection",
+		"Arrange only the selected nodes, keeping others in place",
+		EUserInterfaceActionType::Button,
+		FInputChord(EModifierKey::Control | EModifierKey::Shift | EModifierKey::Alt, EKeys::L));
+}
+
+void FBlueprintAutoLayoutModule::StartupModule()
+{
+	RegisterImportHooks();
+
+	if (IsRunningCommandlet() || !FSlateApplication::IsInitialized())
+	{
+		return;
+	}
+
+	FBALCommands::Register();
+
+	CommandList = MakeShared<FUICommandList>();
+	CommandList->MapAction(
+		FBALCommands::Get().LayoutGraph,
+		FExecuteAction::CreateRaw(this, &FBlueprintAutoLayoutModule::OnLayoutGraph));
+	CommandList->MapAction(
+		FBALCommands::Get().LayoutSelection,
+		FExecuteAction::CreateRaw(this, &FBlueprintAutoLayoutModule::OnLayoutSelection));
+
+	UToolMenus::RegisterStartupCallback(
+		FSimpleMulticastDelegate::FDelegate::CreateRaw(
+			this, &FBlueprintAutoLayoutModule::RegisterMenuExtensions));
+
+	if (GEditor)
+	{
+		if (UAssetEditorSubsystem* AESub = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
+		{
+			AssetEditorOpenedHandle = AESub->OnAssetEditorOpened().AddRaw(
+				this, &FBlueprintAutoLayoutModule::OnAssetEditorOpened);
+		}
+	}
+
+	bUiRegistered = true;
+}
+
+void FBlueprintAutoLayoutModule::RegisterImportHooks()
+{
+	HookRegistrationState = MakeUnique<FHookRegistrationState>();
+
+	if (FBlueprintLispModule::IsAvailable())
+	{
+		HookRegistrationState->BlueprintLispHook = MakeShared<FBlueprintLispAutoLayoutHook>();
+		HookRegistrationState->BlueprintLispHandle = FBlueprintLispModule::Get().RegisterImportLifecycleHook(
+			HookRegistrationState->BlueprintLispHook.ToSharedRef());
+	}
+
+	if (FAnimBP2FPModule::IsAvailable())
+	{
+		HookRegistrationState->AnimBP2FPHook = MakeShared<FAnimBP2FPAutoLayoutHook>();
+		HookRegistrationState->AnimBP2FPHandle = FAnimBP2FPModule::Get().RegisterImportLifecycleHook(
+			HookRegistrationState->AnimBP2FPHook.ToSharedRef());
+	}
+
+	if (FMatBP2FPModule::IsAvailable())
+	{
+		HookRegistrationState->MatBP2FPHook = MakeShared<FMatBP2FPAutoLayoutHook>();
+		HookRegistrationState->MatBP2FPHandle = FMatBP2FPModule::Get().RegisterImportLifecycleHook(
+			HookRegistrationState->MatBP2FPHook.ToSharedRef());
+	}
+}
+
+void FBlueprintAutoLayoutModule::UnregisterImportHooks()
+{
+	if (!HookRegistrationState)
+	{
+		return;
+	}
+
+	if (HookRegistrationState->BlueprintLispHandle.IsValid() && FBlueprintLispModule::IsAvailable())
+	{
+		FBlueprintLispModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->BlueprintLispHandle);
+	}
+
+	if (HookRegistrationState->AnimBP2FPHandle.IsValid() && FAnimBP2FPModule::IsAvailable())
+	{
+		FAnimBP2FPModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->AnimBP2FPHandle);
+	}
+
+	if (HookRegistrationState->MatBP2FPHandle.IsValid() && FMatBP2FPModule::IsAvailable())
+	{
+		FMatBP2FPModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->MatBP2FPHandle);
+	}
+
+	HookRegistrationState.Reset();
+}
+
+void FBlueprintAutoLayoutModule::OnAssetEditorOpened(UObject* /*Asset*/)
+{
+	RegisterMenuExtensions();
+}
+
+void FBlueprintAutoLayoutModule::ShutdownModule()
+{
+	if (bUiRegistered && GEditor)
+	{
+		if (UAssetEditorSubsystem* AESub = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
+		{
+			AESub->OnAssetEditorOpened().Remove(AssetEditorOpenedHandle);
+		}
+	}
+
+	if (bUiRegistered)
+	{
+		UToolMenus::UnRegisterStartupCallback(this);
+		UToolMenus::UnregisterOwner(this);
+		FBALCommands::Unregister();
+		bUiRegistered = false;
+	}
+
+	UnregisterImportHooks();
+}
+
+void FBlueprintAutoLayoutModule::RegisterMenuExtensions()
+{
+	if (!bUiRegistered)
+	{
+		return;
+	}
+
+	FToolMenuOwnerScoped OwnerScoped(this);
+
+	FUIAction ActionLayoutGraph(
+		FExecuteAction::CreateRaw(this, &FBlueprintAutoLayoutModule::OnLayoutGraph));
+	FUIAction ActionLayoutSelection(
+		FExecuteAction::CreateRaw(this, &FBlueprintAutoLayoutModule::OnLayoutSelection));
+
+	static const TCHAR* ToolbarCandidates[] = {
+		TEXT("AssetEditor.BlueprintEditor.ToolBar"),
+		TEXT("AssetEditor.DefaultToolBar"),
+	};
+	for (const TCHAR* Name : ToolbarCandidates)
+	{
+		if (UToolMenus::Get()->IsMenuRegistered(FName(Name)))
+		{
+			if (UToolMenu* Toolbar = UToolMenus::Get()->ExtendMenu(FName(Name)))
+			{
+				FToolMenuSection& Section = Toolbar->FindOrAddSection("BlueprintAutoLayout");
+				Section.AddEntry(FToolMenuEntry::InitToolBarButton(
+					"BAL_LayoutGraph",
+					ActionLayoutGraph,
+					LOCTEXT("LayoutGraph", "Auto Layout"),
+					LOCTEXT("LayoutGraphTip", "Auto-arrange all nodes in the current graph (Ctrl+Shift+L)"),
+					FSlateIcon(FAppStyle::GetAppStyleSetName(), "BlueprintEditor.AutoArrange")));
+				Section.AddEntry(FToolMenuEntry::InitToolBarButton(
+					"BAL_LayoutSelection",
+					ActionLayoutSelection,
+					LOCTEXT("LayoutSel", "Layout Selection"),
+					LOCTEXT("LayoutSelTip", "Auto-arrange only the selected nodes"),
+					FSlateIcon(FAppStyle::GetAppStyleSetName(), "BlueprintEditor.AutoArrange")));
+			}
+		}
+	}
+
+	if (UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("GraphEditor.GraphNodeContextMenu"))
+	{
+		FToolMenuSection& Section = Menu->FindOrAddSection("BlueprintAutoLayout");
+		Section.Label = LOCTEXT("BALSection", "Auto Layout");
+		Section.AddMenuEntry("BAL_LayoutGraph2",
+			LOCTEXT("LayoutGraph2", "Auto Layout Graph"),
+			LOCTEXT("LayoutGraphTip2", "Auto-arrange all nodes"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "BlueprintEditor.AutoArrange"),
+			ActionLayoutGraph);
+		Section.AddMenuEntry("BAL_LayoutSelection2",
+			LOCTEXT("LayoutSel2", "Auto Layout Selection"),
+			LOCTEXT("LayoutSelTip2", "Auto-arrange selected nodes only"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "BlueprintEditor.AutoArrange"),
+			ActionLayoutSelection);
+	}
+}
+
+void FBlueprintAutoLayoutModule::UnregisterMenuExtensions()
+{
+}
+
+void FBlueprintAutoLayoutModule::ExtendGraphEditorContextMenu()
+{
+}
+
+void FBlueprintAutoLayoutModule::OnLayoutGraph()
+{
+	UEdGraph* Graph = GetActiveGraph();
+	if (!Graph)
+	{
+		FMessageDialog::Open(EAppMsgType::Ok,
+			LOCTEXT("NoGraph", "No graph is currently focused. Please open a Blueprint, Material, or Animation Blueprint editor."));
+		return;
+	}
+
+	FBlueprintAutoLayoutEngine::Layout(Graph);
+}
+
+void FBlueprintAutoLayoutModule::OnLayoutSelection()
+{
+	UEdGraph* Graph = GetActiveGraph();
+	if (!Graph)
+	{
+		return;
+	}
+
+	TSet<UEdGraphNode*> Selection = GetSelectedNodes(Graph);
+	if (Selection.IsEmpty())
+	{
+		FBlueprintAutoLayoutEngine::Layout(Graph);
+		return;
+	}
+
+	FBlueprintAutoLayoutEngine::LayoutSelection(Graph, Selection);
+}
+
+UEdGraph* FBlueprintAutoLayoutModule::GetActiveGraph() const
+{
+	if (!GEditor || !FSlateApplication::IsInitialized())
+	{
+		return nullptr;
+	}
+
+	UAssetEditorSubsystem* AssetEditorSubsystem =
+		GEditor->GetEditorSubsystem<UAssetEditorSubsystem>();
+	if (!AssetEditorSubsystem)
+	{
+		return nullptr;
+	}
+
+	TArray<UObject*> EditedAssets = AssetEditorSubsystem->GetAllEditedAssets();
+	for (UObject* Asset : EditedAssets)
+	{
+		if (!Asset)
+		{
+			continue;
+		}
+
+		IAssetEditorInstance* EditorInstance = AssetEditorSubsystem->FindEditorForAsset(Asset, false);
+		if (!EditorInstance)
+		{
+			continue;
+		}
+
+		if (EditorInstance->GetEditorName() == FName("BlueprintEditor"))
+		{
+			if (FBlueprintEditor* BPEditor = static_cast<FBlueprintEditor*>(EditorInstance))
+			{
+				if (UEdGraph* Graph = BPEditor->GetFocusedGraph())
+				{
+					return Graph;
+				}
+			}
+		}
+
+		if (EditorInstance->GetEditorName() == FName("MaterialEditor"))
+		{
+			TArray<UObject*> SubObjects;
+			GetObjectsWithOuter(Asset, SubObjects, EGetObjectsFlags::None);
+			for (UObject* Sub : SubObjects)
+			{
+				if (UMaterialGraph* MatGraph = Cast<UMaterialGraph>(Sub))
+				{
+					return MatGraph;
+				}
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+TSet<UEdGraphNode*> FBlueprintAutoLayoutModule::GetSelectedNodes(UEdGraph* Graph) const
+{
+	TSet<UEdGraphNode*> Selected;
+	if (!Graph || !GEditor)
+	{
+		return Selected;
+	}
+
+	UAssetEditorSubsystem* Sub = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>();
+	if (!Sub)
+	{
+		return Selected;
+	}
+
+	for (UObject* Asset : Sub->GetAllEditedAssets())
+	{
+		if (!Asset)
+		{
+			continue;
+		}
+		IAssetEditorInstance* Inst = Sub->FindEditorForAsset(Asset, false);
+		if (!Inst)
+		{
+			continue;
+		}
+
+		if (Inst->GetEditorName() == FName("BlueprintEditor"))
+		{
+			FBlueprintEditor* BPEditor = static_cast<FBlueprintEditor*>(Inst);
+			UEdGraph* FocusedGraph = BPEditor->GetFocusedGraph();
+			if (FocusedGraph == Graph)
+			{
+				FGraphPanelSelectionSet RawSet = BPEditor->GetSelectedNodes();
+				for (UObject* Obj : RawSet)
+				{
+					if (UEdGraphNode* N = Cast<UEdGraphNode>(Obj))
+					{
+						Selected.Add(N);
+					}
+				}
+				return Selected;
+			}
+		}
+	}
+
+	return Selected;
+}
+
+#undef LOCTEXT_NAMESPACE
+
+IMPLEMENT_MODULE(FBlueprintAutoLayoutModule, BlueprintAutoLayout)
