@@ -39,15 +39,18 @@
   "Plugins": [
     {
       "Name": "BlueprintLisp",
-      "Enabled": true
+      "Enabled": true,
+      "Optional": true
     },
     {
       "Name": "AnimBP2FP",
-      "Enabled": true
+      "Enabled": true,
+      "Optional": true
     },
     {
       "Name": "MatBP2FP",
-      "Enabled": true
+      "Enabled": true,
+      "Optional": true
     }
   ]
 }

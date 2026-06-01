@@ -5,6 +5,16 @@
 #include "BlueprintAutoLayoutEngine.h"
 #include "BALConstraintCollector.h"
 
+#if WITH_BLUEPRINTLISP
+#include "BlueprintLispModule.h"
+#endif
+#if WITH_ANIMBP2FP
+#include "AnimBP2FPModule.h"
+#endif
+#if WITH_MATBP2FP
+#include "MatBP2FPModule.h"
+#endif
+
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 
@@ -36,11 +46,16 @@
 
 #define LOCTEXT_NAMESPACE "BlueprintAutoLayout"
 
+#define BAL_ANY_DSL_INTEGRATION (WITH_BLUEPRINTLISP || WITH_ANIMBP2FP || WITH_MATBP2FP)
+
 namespace
 {
+#if BAL_ANY_DSL_INTEGRATION
 	const FName AutoLayoutBehaviorName(TEXT("AutoLayout"));
 	constexpr int32 AutoLayoutEarlyPriority = 100;
+#endif // BAL_ANY_DSL_INTEGRATION
 
+#if WITH_BLUEPRINTLISP
 	TSet<UEdGraphNode*> CollectChangedGraphNodes(const TArray<BlueprintLispImportLifecycle::FImportNodeChange>& Changes)
 	{
 		TSet<UEdGraphNode*> Nodes;
@@ -53,7 +68,9 @@ namespace
 		}
 		return Nodes;
 	}
+#endif // WITH_BLUEPRINTLISP
 
+#if WITH_ANIMBP2FP
 	TSet<UEdGraphNode*> CollectChangedGraphNodes(const TArray<AnimBP2FPImportLifecycle::FImportNodeChange>& Changes)
 	{
 		TSet<UEdGraphNode*> Nodes;
@@ -66,7 +83,9 @@ namespace
 		}
 		return Nodes;
 	}
+#endif // WITH_ANIMBP2FP
 
+#if WITH_MATBP2FP
 	TSet<UEdGraphNode*> CollectChangedGraphNodes(const TArray<MatBP2FPImportLifecycle::FImportNodeChange>& Changes)
 	{
 		TSet<UEdGraphNode*> Nodes;
@@ -79,7 +98,9 @@ namespace
 		}
 		return Nodes;
 	}
+#endif // WITH_MATBP2FP
 
+#if BAL_ANY_DSL_INTEGRATION
 	template <typename ContextType>
 	void RunGraphLayout(const ContextType& Context, const TSet<UEdGraphNode*>& ChangedNodes)
 	{
@@ -98,7 +119,9 @@ namespace
 		}
 		FBlueprintAutoLayoutEngine::LayoutSelection(Context.TargetGraph, ChangedNodes);
 	}
+#endif // BAL_ANY_DSL_INTEGRATION
 
+#if WITH_BLUEPRINTLISP
 	class FBlueprintLispAutoLayoutHook : public BlueprintLispImportLifecycle::IImportLifecycleHook
 	{
 	public:
@@ -116,7 +139,9 @@ namespace
 			RunGraphLayout(Event.Context, CollectChangedGraphNodes(Event.Changes));
 		}
 	};
+#endif // WITH_BLUEPRINTLISP
 
+#if WITH_ANIMBP2FP
 	class FAnimBP2FPAutoLayoutHook : public AnimBP2FPImportLifecycle::IImportLifecycleHook
 	{
 	public:
@@ -134,7 +159,9 @@ namespace
 			RunGraphLayout(Event.Context, CollectChangedGraphNodes(Event.Changes));
 		}
 	};
+#endif // WITH_ANIMBP2FP
 
+#if WITH_MATBP2FP
 	class FMatBP2FPAutoLayoutHook : public MatBP2FPImportLifecycle::IImportLifecycleHook
 	{
 	public:
@@ -152,16 +179,23 @@ namespace
 			RunGraphLayout(Event.Context, CollectChangedGraphNodes(Event.Changes));
 		}
 	};
+#endif // WITH_MATBP2FP
 }
 
 struct FBlueprintAutoLayoutModule::FHookRegistrationState
 {
+#if WITH_BLUEPRINTLISP
 	TSharedPtr<FBlueprintLispAutoLayoutHook> BlueprintLispHook;
 	BlueprintLispImportLifecycle::FImportLifecycleHookHandle BlueprintLispHandle;
+#endif
+#if WITH_ANIMBP2FP
 	TSharedPtr<FAnimBP2FPAutoLayoutHook> AnimBP2FPHook;
 	AnimBP2FPImportLifecycle::FImportLifecycleHookHandle AnimBP2FPHandle;
+#endif
+#if WITH_MATBP2FP
 	TSharedPtr<FMatBP2FPAutoLayoutHook> MatBP2FPHook;
 	MatBP2FPImportLifecycle::FImportLifecycleHookHandle MatBP2FPHandle;
+#endif
 };
 
 FBALCommands::FBALCommands()
@@ -226,26 +260,32 @@ void FBlueprintAutoLayoutModule::RegisterImportHooks()
 {
 	HookRegistrationState = MakeUnique<FHookRegistrationState>();
 
+#if WITH_BLUEPRINTLISP
 	if (FBlueprintLispModule::IsAvailable())
 	{
 		HookRegistrationState->BlueprintLispHook = MakeShared<FBlueprintLispAutoLayoutHook>();
 		HookRegistrationState->BlueprintLispHandle = FBlueprintLispModule::Get().RegisterImportLifecycleHook(
 			HookRegistrationState->BlueprintLispHook.ToSharedRef());
 	}
+#endif
 
+#if WITH_ANIMBP2FP
 	if (FAnimBP2FPModule::IsAvailable())
 	{
 		HookRegistrationState->AnimBP2FPHook = MakeShared<FAnimBP2FPAutoLayoutHook>();
 		HookRegistrationState->AnimBP2FPHandle = FAnimBP2FPModule::Get().RegisterImportLifecycleHook(
 			HookRegistrationState->AnimBP2FPHook.ToSharedRef());
 	}
+#endif
 
+#if WITH_MATBP2FP
 	if (FMatBP2FPModule::IsAvailable())
 	{
 		HookRegistrationState->MatBP2FPHook = MakeShared<FMatBP2FPAutoLayoutHook>();
 		HookRegistrationState->MatBP2FPHandle = FMatBP2FPModule::Get().RegisterImportLifecycleHook(
 			HookRegistrationState->MatBP2FPHook.ToSharedRef());
 	}
+#endif
 }
 
 void FBlueprintAutoLayoutModule::UnregisterImportHooks()
@@ -255,20 +295,26 @@ void FBlueprintAutoLayoutModule::UnregisterImportHooks()
 		return;
 	}
 
+#if WITH_BLUEPRINTLISP
 	if (HookRegistrationState->BlueprintLispHandle.IsValid() && FBlueprintLispModule::IsAvailable())
 	{
 		FBlueprintLispModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->BlueprintLispHandle);
 	}
+#endif
 
+#if WITH_ANIMBP2FP
 	if (HookRegistrationState->AnimBP2FPHandle.IsValid() && FAnimBP2FPModule::IsAvailable())
 	{
 		FAnimBP2FPModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->AnimBP2FPHandle);
 	}
+#endif
 
+#if WITH_MATBP2FP
 	if (HookRegistrationState->MatBP2FPHandle.IsValid() && FMatBP2FPModule::IsAvailable())
 	{
 		FMatBP2FPModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->MatBP2FPHandle);
 	}
+#endif
 
 	HookRegistrationState.Reset();
 }
@@ -501,5 +547,6 @@ TSet<UEdGraphNode*> FBlueprintAutoLayoutModule::GetSelectedNodes(UEdGraph* Graph
 }
 
 #undef LOCTEXT_NAMESPACE
+#undef BAL_ANY_DSL_INTEGRATION
 
 IMPLEMENT_MODULE(FBlueprintAutoLayoutModule, BlueprintAutoLayout)

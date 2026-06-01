@@ -62,8 +62,12 @@ MatBP2FP      ─┘
 
 ### 解耦设计
 
-- 钩子注册前用 `FXxxModule::IsAvailable()` 做存在性检查，**任一 DSL 插件缺失都不会导致崩溃**——只是不挂接对应钩子。
+- 三个 DSL 插件均为**可选依赖**（`.uplugin` 标 `Optional: true`）。`Build.cs` 在编译期探测各插件是否存在，存在则加入依赖并定义 `WITH_<PLUGIN>=1`，缺失则定义 `=0`；源码用 `#if WITH_*` 把对应集成编译出。
+- 因此**任一或全部 DSL 插件缺失 / 被禁用，BlueprintAutoLayout 仍能编译、加载、运行**——只是不挂接缺失插件的钩子。
+- 运行期还有 `IsAvailable()` 兜底，处理「插件存在但晚于本插件加载」的场景。
 - 手动入口（菜单 / 快捷键 / `FBlueprintAutoLayoutEngine` API）不依赖任何 DSL 插件，可独立使用。
+
+> 接口细节与鲁棒性分析见 [INTERFACES.md](INTERFACES.md)。
 
 ## 调用方式
 
