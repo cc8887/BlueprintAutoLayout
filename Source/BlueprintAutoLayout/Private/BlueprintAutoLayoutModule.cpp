@@ -5,6 +5,8 @@
 #include "BlueprintAutoLayoutEngine.h"
 #include "BALConstraintCollector.h"
 
+#include "Highlight/BALHighlightAdapter.h"
+
 #if WITH_BLUEPRINTLISP
 #include "BlueprintLispModule.h"
 #endif
@@ -187,14 +189,23 @@ struct FBlueprintAutoLayoutModule::FHookRegistrationState
 #if WITH_BLUEPRINTLISP
 	TSharedPtr<FBlueprintLispAutoLayoutHook> BlueprintLispHook;
 	BlueprintLispImportLifecycle::FImportLifecycleHookHandle BlueprintLispHandle;
+
+	TSharedPtr<FBALBlueprintLispHighlightHook> BlueprintLispHighlightHook;
+	BlueprintLispImportLifecycle::FImportLifecycleHookHandle BlueprintLispHighlightHandle;
 #endif
 #if WITH_ANIMBP2FP
 	TSharedPtr<FAnimBP2FPAutoLayoutHook> AnimBP2FPHook;
 	AnimBP2FPImportLifecycle::FImportLifecycleHookHandle AnimBP2FPHandle;
+
+	TSharedPtr<FBALAnimBP2FPHighlightHook> AnimBP2FPHighlightHook;
+	AnimBP2FPImportLifecycle::FImportLifecycleHookHandle AnimBP2FPHighlightHandle;
 #endif
 #if WITH_MATBP2FP
 	TSharedPtr<FMatBP2FPAutoLayoutHook> MatBP2FPHook;
 	MatBP2FPImportLifecycle::FImportLifecycleHookHandle MatBP2FPHandle;
+
+	TSharedPtr<FBALMatBP2FPHighlightHook> MatBP2FPHighlightHook;
+	MatBP2FPImportLifecycle::FImportLifecycleHookHandle MatBP2FPHighlightHandle;
 #endif
 };
 
@@ -266,6 +277,10 @@ void FBlueprintAutoLayoutModule::RegisterImportHooks()
 		HookRegistrationState->BlueprintLispHook = MakeShared<FBlueprintLispAutoLayoutHook>();
 		HookRegistrationState->BlueprintLispHandle = FBlueprintLispModule::Get().RegisterImportLifecycleHook(
 			HookRegistrationState->BlueprintLispHook.ToSharedRef());
+
+		HookRegistrationState->BlueprintLispHighlightHook = MakeShared<FBALBlueprintLispHighlightHook>();
+		HookRegistrationState->BlueprintLispHighlightHandle = FBlueprintLispModule::Get().RegisterImportLifecycleHook(
+			HookRegistrationState->BlueprintLispHighlightHook.ToSharedRef());
 	}
 #endif
 
@@ -275,6 +290,10 @@ void FBlueprintAutoLayoutModule::RegisterImportHooks()
 		HookRegistrationState->AnimBP2FPHook = MakeShared<FAnimBP2FPAutoLayoutHook>();
 		HookRegistrationState->AnimBP2FPHandle = FAnimBP2FPModule::Get().RegisterImportLifecycleHook(
 			HookRegistrationState->AnimBP2FPHook.ToSharedRef());
+
+		HookRegistrationState->AnimBP2FPHighlightHook = MakeShared<FBALAnimBP2FPHighlightHook>();
+		HookRegistrationState->AnimBP2FPHighlightHandle = FAnimBP2FPModule::Get().RegisterImportLifecycleHook(
+			HookRegistrationState->AnimBP2FPHighlightHook.ToSharedRef());
 	}
 #endif
 
@@ -284,6 +303,10 @@ void FBlueprintAutoLayoutModule::RegisterImportHooks()
 		HookRegistrationState->MatBP2FPHook = MakeShared<FMatBP2FPAutoLayoutHook>();
 		HookRegistrationState->MatBP2FPHandle = FMatBP2FPModule::Get().RegisterImportLifecycleHook(
 			HookRegistrationState->MatBP2FPHook.ToSharedRef());
+
+		HookRegistrationState->MatBP2FPHighlightHook = MakeShared<FBALMatBP2FPHighlightHook>();
+		HookRegistrationState->MatBP2FPHighlightHandle = FMatBP2FPModule::Get().RegisterImportLifecycleHook(
+			HookRegistrationState->MatBP2FPHighlightHook.ToSharedRef());
 	}
 #endif
 }
@@ -300,6 +323,10 @@ void FBlueprintAutoLayoutModule::UnregisterImportHooks()
 	{
 		FBlueprintLispModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->BlueprintLispHandle);
 	}
+	if (HookRegistrationState->BlueprintLispHighlightHandle.IsValid() && FBlueprintLispModule::IsAvailable())
+	{
+		FBlueprintLispModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->BlueprintLispHighlightHandle);
+	}
 #endif
 
 #if WITH_ANIMBP2FP
@@ -307,12 +334,20 @@ void FBlueprintAutoLayoutModule::UnregisterImportHooks()
 	{
 		FAnimBP2FPModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->AnimBP2FPHandle);
 	}
+	if (HookRegistrationState->AnimBP2FPHighlightHandle.IsValid() && FAnimBP2FPModule::IsAvailable())
+	{
+		FAnimBP2FPModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->AnimBP2FPHighlightHandle);
+	}
 #endif
 
 #if WITH_MATBP2FP
 	if (HookRegistrationState->MatBP2FPHandle.IsValid() && FMatBP2FPModule::IsAvailable())
 	{
 		FMatBP2FPModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->MatBP2FPHandle);
+	}
+	if (HookRegistrationState->MatBP2FPHighlightHandle.IsValid() && FMatBP2FPModule::IsAvailable())
+	{
+		FMatBP2FPModule::Get().UnregisterImportLifecycleHook(HookRegistrationState->MatBP2FPHighlightHandle);
 	}
 #endif
 

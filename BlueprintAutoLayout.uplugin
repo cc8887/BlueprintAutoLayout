@@ -26,6 +26,26 @@
       ]
     },
     {
+      "Name": "DrivenHighlight",
+      "Type": "Runtime",
+      "LoadingPhase": "PreDefault",
+      "WhitelistPlatforms": [
+        "Win64",
+        "Mac",
+        "Linux"
+      ]
+    },
+    {
+      "Name": "DrivenHighlightEditor",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "WhitelistPlatforms": [
+        "Win64",
+        "Mac",
+        "Linux"
+      ]
+    },
+    {
       "Name": "BlueprintAutoLayoutTests",
       "Type": "Editor",
       "LoadingPhase": "Default",

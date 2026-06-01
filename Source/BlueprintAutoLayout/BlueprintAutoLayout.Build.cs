@@ -52,6 +52,10 @@ public class BlueprintAutoLayout : ModuleRules
 
 			// Settings
 			"DeveloperSettings",
+
+			// Sister modules (DSL-agnostic highlight subsystem)
+			"DrivenHighlight",
+			"DrivenHighlightEditor",
 		});
 	}
 

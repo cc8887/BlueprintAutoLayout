@@ -28,6 +28,10 @@ public class BlueprintAutoLayoutTests : ModuleRules
 			// The plugin under test
 			"BlueprintAutoLayout",
 
+			// Sister modules (highlight subsystem under test)
+			"DrivenHighlight",
+			"DrivenHighlightEditor",
+
 			// Graph infrastructure (for UEdGraph, UEdGraphNode, UEdGraphPin, UEdGraphNode_Comment)
 			"UnrealEd",
 			"BlueprintGraph",
