@@ -1,7 +1,8 @@
 // BlueprintAutoLayout.Build.cs
 // Copyright (c) 2026 ccc887. All Rights Reserved.
 
-using System.IO;
+using System.Collections.Generic;
+using EpicGames.Core;
 using UnrealBuildTool;
 
 public class BlueprintAutoLayout : ModuleRules
@@ -19,12 +20,13 @@ public class BlueprintAutoLayout : ModuleRules
 
 		// ── Optional DSL-plugin integrations ──────────────────────────
 		// Each of these plugins exposes an identical import-lifecycle hook
-		// interface. They are optional: when a plugin is not present in the
-		// project we drop the dependency and compile out the corresponding
+		// interface. They are optional: when a plugin is not enabled for this
+		// target we drop the dependency and compile out the corresponding
 		// hook via the WITH_<PLUGIN> macros below.
-		AddOptionalPluginModule("BlueprintLisp", "WITH_BLUEPRINTLISP");
-		AddOptionalPluginModule("AnimBP2FP",     "WITH_ANIMBP2FP");
-		AddOptionalPluginModule("MatBP2FP",      "WITH_MATBP2FP");
+		HashSet<string> EnabledPlugins = GetEnabledProjectPluginNames(Target);
+		AddOptionalPluginModule(EnabledPlugins, "BlueprintLisp", "WITH_BLUEPRINTLISP");
+		AddOptionalPluginModule(EnabledPlugins, "AnimBP2FP",     "WITH_ANIMBP2FP");
+		AddOptionalPluginModule(EnabledPlugins, "MatBP2FP",      "WITH_MATBP2FP");
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
@@ -56,12 +58,12 @@ public class BlueprintAutoLayout : ModuleRules
 	/// <summary>
 	/// Adds <paramref name="ModuleName"/> as a public dependency and defines
 	/// <paramref name="DefineName"/>=1 only if the corresponding plugin is
-	/// discoverable; otherwise defines it =0 so the source can compile the
-	/// integration out.
+	/// enabled for the target; otherwise defines it =0 so the source can
+	/// compile the integration out.
 	/// </summary>
-	private void AddOptionalPluginModule(string ModuleName, string DefineName)
+	private void AddOptionalPluginModule(HashSet<string> EnabledPlugins, string ModuleName, string DefineName)
 	{
-		if (IsPluginAvailable(ModuleName))
+		if (EnabledPlugins.Contains(ModuleName))
 		{
 			PublicDependencyModuleNames.Add(ModuleName);
 			PublicDefinitions.Add(DefineName + "=1");
@@ -73,30 +75,39 @@ public class BlueprintAutoLayout : ModuleRules
 	}
 
 	/// <summary>
-	/// Detects whether a sibling plugin (a directory containing
-	/// "&lt;Name&gt;.uplugin") exists under the same Plugins root as this
-	/// plugin. This keeps the check engine-version agnostic and avoids
-	/// relying on UBT-internal plugin enumeration APIs.
+	/// Returns the set of project plugin names that are actually enabled for
+	/// this target, using UBT's own plugin discovery and enablement logic.
+	///
+	/// This is authoritative: it honours the .uproject "Enabled" flag,
+	/// per-platform / per-target / per-configuration filtering, and — unlike a
+	/// naive recursive file search — it ignores stray *.uplugin copies that
+	/// live under packaged-output or intermediate folders (UBT stops
+	/// descending a directory subtree once it finds a .uplugin there).
 	/// </summary>
-	private bool IsPluginAvailable(string PluginName)
+	private static HashSet<string> GetEnabledProjectPluginNames(ReadOnlyTargetRules Target)
 	{
-		// ModuleDirectory = .../BlueprintAutoLayout/Source/BlueprintAutoLayout
-		// Plugins root     = .../  (parent of the BlueprintAutoLayout plugin dir)
-		DirectoryInfo PluginDir = new DirectoryInfo(
-			Path.Combine(ModuleDirectory, "..", "..")); // BlueprintAutoLayout
-		DirectoryInfo PluginsRoot = PluginDir.Parent;   // Plugins/
-		if (PluginsRoot == null || !PluginsRoot.Exists)
+		HashSet<string> Result = new HashSet<string>(System.StringComparer.OrdinalIgnoreCase);
+
+		// A project file is required to resolve project plugins; if there is
+		// none (e.g. building an engine-only target) treat all optional
+		// integrations as absent.
+		if (Target.ProjectFile == null)
 		{
-			return false;
+			return Result;
 		}
 
-		// Search any descendant for "<PluginName>.uplugin" (plugins may be
-		// nested in sub-folders).
-		foreach (FileInfo Uplugin in PluginsRoot.GetFiles(
-			PluginName + ".uplugin", SearchOption.AllDirectories))
+		ProjectDescriptor Project = ProjectDescriptor.FromFile(Target.ProjectFile);
+		DirectoryReference ProjectDir = Target.ProjectFile.Directory;
+
+		foreach (PluginInfo Plugin in Plugins.ReadProjectPlugins(ProjectDir))
 		{
-			return true;
+			if (Plugins.IsPluginEnabledForTarget(
+				Plugin, Project, Target.Platform, Target.Configuration, Target.Type))
+			{
+				Result.Add(Plugin.Name);
+			}
 		}
-		return false;
+
+		return Result;
 	}
 }
