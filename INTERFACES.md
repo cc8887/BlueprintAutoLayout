@@ -8,13 +8,13 @@
 
 三个 DSL 插件各自在 `<Plugin>Module.h` 中声明了一套**结构完全相同**的导入生命周期接口，仅命名空间与导出宏不同：
 
-| 概念 | BlueprintLisp | AnimBP2FP | MatBP2FP |
-|------|--------------|-----------|----------|
-| 命名空间 | `BlueprintLispImportLifecycle` | `AnimBP2FPImportLifecycle` | `MatBP2FPImportLifecycle` |
-| 导出宏 | `BLUEPRINTLISP_API` | `ANIMBP2FP_API` | `MATBP2FP_API` |
-| 模块类 | `FBlueprintLispModule` | `FAnimBP2FPModule` | `FMatBP2FPModule` |
-| Host 接口 | `IBlueprintLispImportHookHost` | `IAnimBP2FPImportHookHost` | `IMatBP2FPImportHookHost` |
-| 模块名（字符串） | `"BlueprintLisp"` | `"AnimBP2FP"` | `"MatBP2FP"` |
+| 概念       | BlueprintLisp                  | AnimBP2FP                  | MatBP2FP                  |
+| -------- | ------------------------------ | -------------------------- | ------------------------- |
+| 命名空间     | `BlueprintLispImportLifecycle` | `AnimBP2FPImportLifecycle` | `MatBP2FPImportLifecycle` |
+| 导出宏      | `BLUEPRINTLISP_API`            | `ANIMBP2FP_API`            | `MATBP2FP_API`            |
+| 模块类      | `FBlueprintLispModule`         | `FAnimBP2FPModule`         | `FMatBP2FPModule`         |
+| Host 接口  | `IBlueprintLispImportHookHost` | `IAnimBP2FPImportHookHost` | `IMatBP2FPImportHookHost` |
+| 模块名（字符串） | `"BlueprintLisp"`              | `"AnimBP2FP"`              | `"MatBP2FP"`              |
 
 ### 1.1 生命周期阶段 `EImportLifecyclePhase`
 
@@ -184,12 +184,12 @@ PublicDependencyModuleNames.AddRange(new[]
 
 ### 小结
 
-| 场景 | 结果 |
-|------|------|
-| 三个插件都在 | ✅ 正常，全部挂钩 |
-| 三个都在、但某个运行时晚于本插件加载 | ✅ 正常（`IsAvailable` 兜底，仅该项不挂钩） |
-| 任一插件**完全缺失**（源码/插件目录没有） | ✅ 编译期检测缺失 → 编译出该集成，正常加载运行 |
-| 任一插件存在但被**禁用** | ✅ `Optional` 依赖，本插件正常加载（仅运行期不挂对应钩子） |
+| 场景                      | 结果                                  |
+| ----------------------- | ----------------------------------- |
+| 三个插件都在                  | ✅ 正常，全部挂钩                           |
+| 三个都在、但某个运行时晚于本插件加载      | ✅ 正常（`IsAvailable` 兜底，仅该项不挂钩）       |
+| 任一插件**完全缺失**（源码/插件目录没有） | ✅ 编译期检测缺失 → 编译出该集成，正常加载运行           |
+| 任一插件存在但被**禁用**          | ✅ `Optional` 依赖，本插件正常加载（仅运行期不挂对应钩子） |
 
 > 下表为**改造前**的旧行为（仅作历史参考）：任一插件物理缺失会导致编译失败 / UE 拒绝加载，运行期 `IsAvailable` 防御代码触及不到。本插件现已完成下节所述的可选依赖改造。
 
@@ -231,10 +231,10 @@ PublicDependencyModuleNames.AddRange(new[]
 
 ### 验证矩阵（改造后）
 
-| 三个插件状态 | 编译 | 加载 | 运行 |
-|------|------|------|------|
-| 全部存在 | ✅ | ✅ | ✅ 全挂钩 |
-| 部分存在 | ✅ 仅编译存在项 | ✅ | ✅ 仅挂存在项的钩子 |
-| 全部缺失 | ✅ 集成全部编译出 | ✅ | ✅ 仅手动入口可用 |
+| 三个插件状态 | 编译        | 加载  | 运行         |
+| ------ | --------- | --- | ---------- |
+| 全部存在   | ✅         | ✅   | ✅ 全挂钩      |
+| 部分存在   | ✅ 仅编译存在项  | ✅   | ✅ 仅挂存在项的钩子 |
+| 全部缺失   | ✅ 集成全部编译出 | ✅   | ✅ 仅手动入口可用  |
 
 手动入口（工具栏 / 快捷键 / `FBlueprintAutoLayoutEngine` API）在任何组合下都可用。
