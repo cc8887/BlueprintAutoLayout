@@ -338,3 +338,71 @@ bool FBALTest_Pipeline_PureOnlyGraph::RunTest(const FString& /*Params*/)
 	AddInfo(TEXT("Pure-only graph: no crash"));
 	return true;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Incremental-patch scenario: MatBP2FP performs an in-place property patch and
+//  broadcasts a single changed node. The AutoLayout hook responds with
+//  LayoutSelection over just that node, so the patched node should be re-placed
+//  sensibly relative to its (unmoved) neighbours.
+//
+//  This guards the behaviour relied on by MatBPImporter's incremental-patch
+//  branch (MatBP_BroadcastIncrementalNodeChanges -> PostNodeChanges ->
+//  RunGraphLayout -> LayoutSelection).
+//
+//  A → B → C → D ; only C is "changed" (displaced) and selected.
+//  Expect: A, B, D pinned; C re-placed between B and D without overlap.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FBALTest_Pipeline_IncrementalSingleNodeSelection,
+	"BlueprintAutoLayout.Pipeline.IncrementalSingleNodeSelection",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FBALTest_Pipeline_IncrementalSingleNodeSelection::RunTest(const FString& /*Params*/)
+{
+	using namespace BALTest;
+
+	// A neatly laid-out chain (as if produced by a prior full layout).
+	UEdGraph* G = MakeGraph();
+	UEdGraphNode* A = MakeNode(G, true, 0, 0, 0,    0);
+	UEdGraphNode* B = MakeNode(G, true, 0, 0, 300,  0);
+	UEdGraphNode* C = MakeNode(G, true, 0, 0, 600,  0);
+	UEdGraphNode* D = MakeNode(G, true, 0, 0, 900,  0);
+	WireExec(A, B);
+	WireExec(B, C);
+	WireExec(C, D);
+
+	// Simulate an incremental patch displacing the changed node C far away.
+	C->NodePosX = 5000;
+	C->NodePosY = 4000;
+
+	// Neighbours' positions are authoritative and must be preserved.
+	const int32 AOrigX = A->NodePosX, AOrigY = A->NodePosY;
+	const int32 BOrigX = B->NodePosX, BOrigY = B->NodePosY;
+	const int32 DOrigX = D->NodePosX, DOrigY = D->NodePosY;
+
+	// Only the changed node is selected (mirrors a single-property patch).
+	TSet<UEdGraphNode*> Selection;
+	Selection.Add(C);
+
+	FBALSettings S;
+	S.GridSnap = 8.f;
+	FBlueprintAutoLayoutEngine::LayoutSelection(G, Selection, S);
+
+	// Unselected neighbours must not move.
+	TestEqual(TEXT("A.X pinned"), A->NodePosX, AOrigX);
+	TestEqual(TEXT("A.Y pinned"), A->NodePosY, AOrigY);
+	TestEqual(TEXT("B.X pinned"), B->NodePosX, BOrigX);
+	TestEqual(TEXT("B.Y pinned"), B->NodePosY, BOrigY);
+	TestEqual(TEXT("D.X pinned"), D->NodePosX, DOrigX);
+	TestEqual(TEXT("D.Y pinned"), D->NodePosY, DOrigY);
+
+	// The changed node must have been pulled back from its displaced position
+	// to somewhere sensible near its neighbours (not left at 5000,4000).
+	TestTrue(TEXT("C moved back toward the chain"), C->NodePosX < 5000);
+	TestTrue(TEXT("C re-placed near its neighbours' X band"),
+		C->NodePosX >= B->NodePosX && C->NodePosX <= D->NodePosX + 600);
+
+	// No overlaps after the selection layout.
+	TestFalse(TEXT("no overlap after incremental selection layout"), AnyOverlap(G, 0.f));
+
+	return true;
+}
