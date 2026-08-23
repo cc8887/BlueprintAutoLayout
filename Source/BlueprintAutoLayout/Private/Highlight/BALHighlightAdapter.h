@@ -32,7 +32,7 @@ namespace BALHighlightAdapter
 	/** Behavior token consumed by the highlight adapter. Producers must add
 	 *  this to FImportLifecycleContext::RequestedBehaviors to enable highlight
 	 *  on a given import session. */
-	inline const FName HighlightBehaviorName = FName(TEXT("Highlight"));
+	static const FName HighlightBehaviorName(TEXT("Highlight"));
 
 	/** Map a DSL-namespaced change-type enum to the runtime-side enum. */
 	template <typename DSLChangeTypeEnum>

@@ -31,6 +31,8 @@ static void SolveGraph(UEdGraph* G,
 	FBALLayoutSolver::FSolverInput Input;
 	Input.Proxies        = &OutResult.Proxies;
 	Input.ExecRoots      = &OutResult.ExecRoots;
+	Input.Edges          = &OutResult.Edges;
+	Input.Components     = &OutResult.Components;
 	Input.IsolatedPures  = &OutResult.IsolatedPures;
 	Input.IsolatedNodes  = &OutResult.IsolatedNodes;
 	Input.PureDir        = PureDir;
@@ -375,6 +377,8 @@ bool FBALTest_LockedExecNotMoved::RunTest(const FString& /*Params*/)
 	FBALLayoutSolver::FSolverInput Input;
 	Input.Proxies       = &R.Proxies;
 	Input.ExecRoots     = &R.ExecRoots;
+	Input.Edges         = &R.Edges;
+	Input.Components    = &R.Components;
 	Input.IsolatedPures = &R.IsolatedPures;
 	Input.IsolatedNodes = &R.IsolatedNodes;
 	Input.Constraints   = &Constraints;
@@ -383,8 +387,10 @@ bool FBALTest_LockedExecNotMoved::RunTest(const FString& /*Params*/)
 	FBALLayoutSolver::Solve(Input);
 
 	const FVector2D& LockedOut = R.Proxies[Locked].OutPos;
-	TestEqual(TEXT("Locked X unchanged"), LockedOut.X, 1234.0);
-	TestEqual(TEXT("Locked Y unchanged"), LockedOut.Y, 567.0);
+	TestEqual(TEXT("Locked X unchanged"), LockedOut.X,
+		static_cast<decltype(LockedOut.X)>(1234));
+	TestEqual(TEXT("Locked Y unchanged"), LockedOut.Y,
+		static_cast<decltype(LockedOut.Y)>(567));
 
 	return true;
 }

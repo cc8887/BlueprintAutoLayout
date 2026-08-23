@@ -157,6 +157,65 @@ inline void WireData(UEdGraphNode* From, int32 OutIdx,
 	}
 }
 
+/** Find the Nth pin with the requested direction and category. */
+inline UEdGraphPin* FindTypedPin(UEdGraphNode* Node,
+                                EEdGraphPinDirection Direction,
+                                FName Category,
+                                int32 Index = 0)
+{
+	if (!Node || Index < 0)
+	{
+		return nullptr;
+	}
+
+	int32 MatchIndex = 0;
+	for (UEdGraphPin* Pin : Node->Pins)
+	{
+		if (!Pin || Pin->Direction != Direction || Pin->PinType.PinCategory != Category)
+		{
+			continue;
+		}
+		if (MatchIndex++ == Index)
+		{
+			return Pin;
+		}
+	}
+	return nullptr;
+}
+
+/** Add another execution output pin to a test node. */
+inline UEdGraphPin* AddExecOutput(UEdGraphNode* Node, FName PinName)
+{
+	if (!Node)
+	{
+		return nullptr;
+	}
+	FEdGraphPinType ExecType;
+	ExecType.PinCategory = FName(TEXT("exec"));
+	return Node->CreatePin(EGPD_Output, ExecType, PinName);
+}
+
+/** Link two already-resolved pins bidirectionally. */
+inline void LinkPins(UEdGraphPin* OutputPin, UEdGraphPin* InputPin)
+{
+	if (!OutputPin || !InputPin)
+	{
+		return;
+	}
+	OutputPin->LinkedTo.AddUnique(InputPin);
+	InputPin->LinkedTo.AddUnique(OutputPin);
+}
+
+/** Wire a specific execution output to a specific execution input. */
+inline void WireExecPins(UEdGraphNode* From, int32 OutputIndex,
+                         UEdGraphNode* To, int32 InputIndex = 0)
+{
+	const FName ExecCategory(TEXT("exec"));
+	LinkPins(
+		FindTypedPin(From, EGPD_Output, ExecCategory, OutputIndex),
+		FindTypedPin(To, EGPD_Input, ExecCategory, InputIndex));
+}
+
 // ── Proxy builder (bypass Analyze for direct solver tests) ─────────────────
 
 /** Build a minimal FBALNode proxy manually (for LayoutSolver / CollisionResolver unit tests). */

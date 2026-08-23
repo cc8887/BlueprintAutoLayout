@@ -25,9 +25,10 @@ public:
 	 * @return             Number of nodes actually written.
 	 */
 	static int32 Commit(UEdGraph* Graph,
-	                    const TMap<UEdGraphNode*, FBALNode>& Proxies,
+	                    TMap<UEdGraphNode*, FBALNode>&       Proxies,
 	                    const TArray<FBALConstraint>&        Constraints,
-	                    const FBALSettings&                  Settings);
+	                    const FBALSettings&                  Settings,
+	                    const TArray<FBALCommentGroup>*      CommentGroups = nullptr);
 
 private:
 	static FVector2D SnapToGrid(FVector2D Pos, float GridSnap);

@@ -116,8 +116,10 @@ bool FBALTest_TwoLockedNodesOverlap::RunTest(const FString& /*Params*/)
 	FBALSettings S;
 	RunResolver(Proxies, S);  // must not crash
 
-	TestEqual(TEXT("Locked A X unchanged"), Proxies[NA].OutPos.X, 0.0);
-	TestEqual(TEXT("Locked B X unchanged"), Proxies[NB].OutPos.X, 0.0);
+	TestEqual(TEXT("Locked A X unchanged"), Proxies[NA].OutPos.X,
+		static_cast<decltype(Proxies[NA].OutPos.X)>(0));
+	TestEqual(TEXT("Locked B X unchanged"), Proxies[NB].OutPos.X,
+		static_cast<decltype(Proxies[NB].OutPos.X)>(0));
 
 	return true;
 }

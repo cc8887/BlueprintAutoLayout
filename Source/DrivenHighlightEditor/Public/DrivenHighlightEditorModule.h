@@ -11,6 +11,9 @@ class IDrivenHighlightInspector;
 class DRIVENHIGHLIGHTEDITOR_API FDrivenHighlightEditorModule : public IModuleInterface
 {
 public:
+	FDrivenHighlightEditorModule();
+	virtual ~FDrivenHighlightEditorModule() override;
+
 	static FDrivenHighlightEditorModule& Get();
 	static bool IsAvailable();
 

@@ -12,8 +12,9 @@ class UEdGraphPin;
 /**
  * Analyses an EdGraph and produces:
  *   - A flat list of FBALNode proxies (one per node)
- *   - An ExecTree rooted at each entry-point exec node
- *   - Pure subtree assignments per Exec consumer
+ *   - A deterministic logical edge graph with reroute chains collapsed
+ *   - Layered execution metadata and a primary forest for compatibility
+ *   - Pure subtree assignments, components, and nested comments
  *
  * Works for ALL graph types (Logic BP, Material, AnimBP) because it
  * operates purely on UEdGraphNode / UEdGraphPin — no K2/Material casts needed
@@ -27,7 +28,7 @@ public:
 		/** All node proxies, keyed by UEdGraphNode* */
 		TMap<UEdGraphNode*, FBALNode>   Proxies;
 
-		/** Roots of exec trees (one per entry-point: Event, FunctionEntry, etc.) */
+		/** Roots of the deterministic primary exec forest. */
 		TArray<FBALExecNode*>           ExecRoots;
 
 		/** Pure nodes that are not reachable from any exec node (true data islands). */
@@ -36,8 +37,17 @@ public:
 		/** All isolated nodes (no connections at all). */
 		TArray<FBALNode*>               IsolatedNodes;
 
-		/** Allocator for FBALExecNode objects (owns lifetime). */
+		/** Allocator for compatibility forest nodes (owns lifetime). */
 		TArray<TUniquePtr<FBALExecNode>> ExecNodePool;
+
+		/** Pin-level logical edges. Reroute chains are collapsed. */
+		TArray<FBALEdge> Edges;
+
+		/** Undirected connected components used for stable anchoring and packing. */
+		TArray<FBALComponent> Components;
+
+		/** Nested comment containment hierarchy. */
+		TArray<FBALCommentGroup> CommentGroups;
 
 		FAnalysisResult()  = default;
 		~FAnalysisResult() = default;
@@ -81,23 +91,27 @@ public:
 
 private:
 	static void ClassifyNodes(UEdGraph* Graph,
-	                          const TMap<UEdGraphNode*, int32>& ConstraintMap,
+	                          const FBALSettings& Settings,
+	                          const TMap<UEdGraphNode*, FBALConstraint>& ConstraintMap,
 	                          TMap<UEdGraphNode*, FBALNode>& OutProxies);
 
-	static void BuildExecTree(TMap<UEdGraphNode*, FBALNode>& Proxies,
-	                          TArray<FBALExecNode*>& OutRoots,
-	                          TArray<TUniquePtr<FBALExecNode>>& Pool);
+	static void BuildLogicalEdges(UEdGraph* Graph,
+	                              const TMap<UEdGraphNode*, FBALNode>& Proxies,
+	                              TArray<FBALEdge>& OutEdges);
+
+	static void BuildExecForest(TMap<UEdGraphNode*, FBALNode>& Proxies,
+	                            TArray<FBALEdge>& Edges,
+	                            TArray<FBALExecNode*>& OutRoots,
+	                            TArray<TUniquePtr<FBALExecNode>>& Pool);
 
 	static void AssignPureSubtrees(TMap<UEdGraphNode*, FBALNode>& Proxies,
+	                               const TArray<FBALEdge>& Edges,
 	                               TArray<FBALExecNode*>& ExecRoots);
 
-	/** DFS to collect all Pure ancestors of an Exec node. */
-	static void CollectPureAncestors(UEdGraphNode* ExecNode,
-	                                 TMap<UEdGraphNode*, FBALNode>& Proxies,
-	                                 TArray<FBALNode*>& OutPures,
-	                                 TSet<UEdGraphNode*>& Visited);
+	static void BuildComponents(TMap<UEdGraphNode*, FBALNode>& Proxies,
+	                            const TArray<FBALEdge>& Edges,
+	                            TArray<FBALComponent>& OutComponents);
 
-	/** Find the deepest exec node that is a common ancestor of all nodes in the set. */
-	static FBALExecNode* FindLCA(const TArray<UEdGraphNode*>& Nodes,
-	                             TArray<FBALExecNode*>& ExecRoots);
+	static void BuildCommentHierarchy(TMap<UEdGraphNode*, FBALNode>& Proxies,
+	                                  TArray<FBALCommentGroup>& OutGroups);
 };

@@ -40,8 +40,10 @@ bool FBALTest_PinnedConstraint::RunTest(const FString& /*Params*/)
 	if (PC)
 	{
 		TestEqual(TEXT("Pinned → Hard"), PC->Type, EBALConstraintType::Hard);
-		TestEqual(TEXT("OriginalPos X"), PC->OriginalPos.X, 100.0);
-		TestEqual(TEXT("OriginalPos Y"), PC->OriginalPos.Y, 200.0);
+		TestEqual(TEXT("OriginalPos X"), PC->OriginalPos.X,
+			static_cast<decltype(PC->OriginalPos.X)>(100));
+		TestEqual(TEXT("OriginalPos Y"), PC->OriginalPos.Y,
+			static_cast<decltype(PC->OriginalPos.Y)>(200));
 	}
 
 	// Unpinned node must not produce a constraint

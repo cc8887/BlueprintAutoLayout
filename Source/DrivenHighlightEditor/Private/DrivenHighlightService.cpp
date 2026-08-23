@@ -14,7 +14,14 @@
 #include "EdGraph/EdGraphNode.h"
 #include "UObject/Object.h"
 #include "Containers/Ticker.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "Widgets/SWindow.h"
+
+#if ENGINE_MAJOR_VERSION >= 5
+using FDrivenHighlightTickerHandle = FTSTicker::FDelegateHandle;
+#else
+using FDrivenHighlightTickerHandle = FDelegateHandle;
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Concrete service. Holds the registries, drives expiry, exposes the API.
@@ -227,13 +234,13 @@ struct FDrivenHighlightEditorModule::FImpl
 	TUniquePtr<FDrivenHighlightService>   Service;
 	TUniquePtr<FDrivenHighlightInspector> Inspector;
 
-	FTSTicker::FDelegateHandle TickerHandle;
+	FDrivenHighlightTickerHandle TickerHandle;
 
 	bool Tick(float /*DeltaTime*/)
 	{
 		const double Now = FPlatformTime::Seconds();
 		const TArray<FName> Expired = Registry.ExpireBefore(Now);
-		if (!Expired.IsEmpty() && Inspector.IsValid())
+		if (Expired.Num() > 0 && Inspector.IsValid())
 		{
 			for (FName Id : Expired)
 			{
@@ -248,6 +255,9 @@ struct FDrivenHighlightEditorModule::FImpl
 		return true; // keep ticking
 	}
 };
+
+FDrivenHighlightEditorModule::FDrivenHighlightEditorModule() = default;
+FDrivenHighlightEditorModule::~FDrivenHighlightEditorModule() = default;
 
 FDrivenHighlightEditorModule& FDrivenHighlightEditorModule::Get()
 {
@@ -270,7 +280,11 @@ void FDrivenHighlightEditorModule::StartupModule()
 
 	Impl->Injector.Init(&Impl->Registry, &Impl->NodeRegistry);
 
+#if ENGINE_MAJOR_VERSION >= 5
 	Impl->TickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+#else
+	Impl->TickerHandle = FTicker::GetCoreTicker().AddTicker(
+#endif
 		FTickerDelegate::CreateRaw(Impl.Get(), &FImpl::Tick),
 		/*Delay=*/ 0.25f /* expiry resolution */);
 
@@ -283,7 +297,11 @@ void FDrivenHighlightEditorModule::ShutdownModule()
 
 	if (Impl->TickerHandle.IsValid())
 	{
+#if ENGINE_MAJOR_VERSION >= 5
 		FTSTicker::GetCoreTicker().RemoveTicker(Impl->TickerHandle);
+#else
+		FTicker::GetCoreTicker().RemoveTicker(Impl->TickerHandle);
+#endif
 	}
 	Impl->Injector.Shutdown();
 	Impl->Service.Reset();

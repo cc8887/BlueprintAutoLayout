@@ -2,7 +2,6 @@
 // Copyright (c) 2026 ccc887. All Rights Reserved.
 
 using System.Collections.Generic;
-using EpicGames.Core;
 using UnrealBuildTool;
 
 public class BlueprintAutoLayout : ModuleRules
@@ -101,7 +100,7 @@ public class BlueprintAutoLayout : ModuleRules
 		}
 
 		ProjectDescriptor Project = ProjectDescriptor.FromFile(Target.ProjectFile);
-		DirectoryReference ProjectDir = Target.ProjectFile.Directory;
+		var ProjectDir = Target.ProjectFile.Directory;
 
 		foreach (PluginInfo Plugin in Plugins.ReadProjectPlugins(ProjectDir))
 		{

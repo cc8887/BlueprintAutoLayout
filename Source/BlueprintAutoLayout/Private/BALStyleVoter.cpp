@@ -18,6 +18,13 @@ EBALPureDir FBALStyleVoter::Vote(const FVoteContext& Ctx)
 	if (Settings.bForceDir)
 		return Settings.ForcedDir;
 
+	// Blueprint data dependencies conventionally read into consumers from the
+	// left. Direction scoring based on pre-layout coordinates is unstable and
+	// can flip on repeated runs, so use West as the deterministic default.
+	return EBALPureDir::West;
+
+#if 0
+
 	TMap<EBALPureDir, int32> Tally;
 	Tally.Add(EBALPureDir::West,  0);
 	Tally.Add(EBALPureDir::East,  0);
@@ -67,6 +74,7 @@ EBALPureDir FBALStyleVoter::Vote(const FVoteContext& Ctx)
 	if (BestVotes == 0) return EBALPureDir::West;
 
 	return Winner;
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────

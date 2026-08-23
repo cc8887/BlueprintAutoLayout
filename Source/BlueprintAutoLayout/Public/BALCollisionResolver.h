@@ -31,6 +31,8 @@ public:
 	static void Resolve(const FResolveInput& Input);
 
 private:
+	typedef TMap<int32, TArray<FBALNode*>> FRigidGroups;
+
 	// ── Spatial hash ─────────────────────────────────────────
 
 	/**
@@ -39,10 +41,11 @@ private:
 	 */
 	struct FSpatialHash
 	{
-		float     CellSize;
+		float     CellSize = 1.f;
+		float     QueryPadding = 0.f;
 		TMap<TPair<int32,int32>, TArray<FBALNode*>> Cells;
 
-		void Build(TArray<FBALNode*>& Nodes, float InCellSize);
+		void Build(TArray<FBALNode*>& Nodes, float InCellSize, float PairMargin);
 		void QueryNeighbors(const FBALNode& Node, TArray<FBALNode*>& Out) const;
 
 	private:
@@ -54,6 +57,7 @@ private:
 
 	static bool RunPushIteration(TArray<FBALNode*>& Nodes,
 	                             FSpatialHash& Hash,
+	                             const FRigidGroups& RigidGroups,
 	                             const FBALSettings& Settings);
 
 	/**
@@ -64,10 +68,15 @@ private:
 	                            const FBALNode& B,
 	                            float Margin);
 
+	/** Apply a movement while honoring Hard and Soft constraints. */
+	static bool MoveNode(FBALNode& Node, FVector2D Delta,
+	                     const FRigidGroups& RigidGroups);
+
 	// ── Compaction ────────────────────────────────────────────
 
 	static void RunCompaction(TArray<FBALNode*>& Nodes,
 	                          const TMap<UEdGraphNode*, FVector2D>& IdealPositions,
 	                          FSpatialHash& Hash,
+	                          const FRigidGroups& RigidGroups,
 	                          const FBALSettings& Settings);
 };

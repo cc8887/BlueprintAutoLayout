@@ -74,7 +74,7 @@ void SDrivenHighlightOverlay::ResolveBindings() const
 {
 	if (!Registry) return;
 	auto& All = Registry->GetAllMutable();
-	if (All.IsEmpty()) return;
+	if (All.Num() == 0) return;
 
 	// Build a quick lookup: WidgetTag → DrivenId(s) for active NamedWidget specs.
 	TMultiMap<FName, FName> TagToIds;

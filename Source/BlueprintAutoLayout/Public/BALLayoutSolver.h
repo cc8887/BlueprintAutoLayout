@@ -8,18 +8,17 @@
 /**
  * Computes ideal (pre-collision) positions for all nodes.
  *
- * Pass 1 — Exec chain layout:
- *   Bottom-up subtree height calculation, then top-down coordinate assignment.
- *   Linear segments stay on the same Y (horizontal).
- *   Fork nodes split the Y band among children.
+ * Pass 1 - Layered graph layout:
+ *   Execution and data-only components are assigned deterministic layers.
+ *   Barycentric sweeps reduce crossings and median pin alignment straightens wires.
  *
- * Pass 2 — Pure "stacked tower" layout:
- *   Each Pure group is stacked tightly (zero Y gap) along the axis perpendicular
- *   to globalPureDir, placed adjacent to its consumer Exec node.
+ * Pass 2 - Pure cluster layout:
+ *   Each owned Pure group is layered outward from its consumer along PureDir.
  *   Multi-depth Pure chains are layered outward from the consumer.
  *
- * Pass 3 — Isolated node packing:
- *   All isolated nodes are gathered into a block placed below-right of the main graph.
+ * Pass 3 - Stable anchoring and component packing:
+ *   Locked boundaries and component anchors stay stable while disconnected regions
+ *   are packed without overlap.
  */
 class BLUEPRINTAUTOLAYOUT_API FBALLayoutSolver
 {
@@ -28,6 +27,8 @@ public:
 	{
 		TMap<UEdGraphNode*, FBALNode>*  Proxies   = nullptr;
 		TArray<FBALExecNode*>*          ExecRoots = nullptr;
+		TArray<FBALEdge>*               Edges     = nullptr;
+		TArray<FBALComponent>*          Components = nullptr;
 		TArray<FBALNode*>*              IsolatedPures  = nullptr;
 		TArray<FBALNode*>*              IsolatedNodes  = nullptr;
 		const TArray<FBALConstraint>*   Constraints    = nullptr;
@@ -38,67 +39,52 @@ public:
 	static void Solve(const FSolverInput& Input);
 
 private:
-	// ── Exec tree passes ─────────────────────────────────────
-
-	/** Recursively compute subtree height (bottom-up). */
-	static float ComputeSubtreeHeight(FBALExecNode* Node,
-	                                  EBALPureDir PureDir,
-	                                  const FBALSettings& Settings);
-
-	/**
-	 * Compute the vertical space reserved for the Pure group attached to an exec node.
-	 * This is added to the exec node's own height when PureDir is North or South.
-	 */
-	static float PureReservedHeight(const FBALExecNode* Node,
+	static void LayoutExecComponent(const FBALComponent& Component,
+	                                TMap<UEdGraphNode*, FBALNode>& Proxies,
+	                                TArray<FBALEdge>& Edges,
+	                                const TMap<UEdGraphNode*, TArray<FBALNode*>>& OwnedPuresByConsumer,
 	                                EBALPureDir PureDir,
 	                                const FBALSettings& Settings);
 
-	/** Recursively assign X/Y coordinates (top-down). */
-	static void AssignExecCoords(FBALExecNode* Node,
-	                             float X, float Y,
-	                             EBALPureDir PureDir,
-	                             const FBALSettings& Settings);
+	static void LayoutDataComponent(const FBALComponent& Component,
+	                                TMap<UEdGraphNode*, FBALNode>& Proxies,
+	                                TArray<FBALEdge>& Edges,
+	                                const FBALSettings& Settings);
 
-	// ── Pure stacking ─────────────────────────────────────────
+	static void ReduceCrossings(TArray<TArray<FBALNode*>>& Layers,
+	                            const TArray<FBALEdge>& Edges,
+	                            const FBALSettings& Settings);
 
-	/** Place all Pure groups for every exec node. */
+	static void AlignLayers(TArray<TArray<FBALNode*>>& Layers,
+	                        const TArray<FBALEdge>& Edges,
+	                        const TMap<UEdGraphNode*, float>& ClusterHeights,
+	                        const FBALSettings& Settings);
+
 	static void PlacePureGroups(TMap<UEdGraphNode*, FBALNode>& Proxies,
-	                            TArray<FBALExecNode*>& ExecRoots,
+	                            const TArray<FBALEdge>& Edges,
+	                            TMap<UEdGraphNode*, TArray<FBALNode*>>& OwnedPuresByConsumer,
 	                            EBALPureDir PureDir,
 	                            const FBALSettings& Settings);
 
-	/** Sort a Pure group to minimize wire crossings (by consumer pin Y, then depth). */
-	static void SortPureGroup(TArray<FBALNode*>& Group,
-	                          const FBALNode& Consumer);
-
-	/** Place one Pure group relative to its consumer at the given direction. */
-	static void StackPureGroup(const TArray<FBALNode*>& Group,
-	                           const FBALNode& Consumer,
-	                           EBALPureDir Dir,
+	static void PlaceKnotNodes(TMap<UEdGraphNode*, FBALNode>& Proxies,
 	                           const FBALSettings& Settings);
 
-	// ── Constraint avoidance ──────────────────────────────────
+	static void PreserveComponentAnchors(TArray<FBALComponent>& Components,
+	                                     TMap<UEdGraphNode*, FBALNode>& Proxies,
+	                                     const FBALSettings& Settings);
 
-	/** Nudge a proposed position away from hard-constraint AABBs. */
-	static FVector2D AvoidConstraintRegions(FVector2D Proposed,
-	                                        FVector2D NodeSize,
-	                                        const TArray<FBALConstraint>& Constraints,
-	                                        const TMap<UEdGraphNode*, FBALNode>& Proxies,
-	                                        EBALPureDir PureDir,
-	                                        const FBALSettings& Settings);
+	static void PackOverlappingComponents(TArray<FBALComponent>& Components,
+	                                      TMap<UEdGraphNode*, FBALNode>& Proxies,
+	                                      const FBALSettings& Settings);
 
-	// ── Isolated node packing ─────────────────────────────────
-
-	static void PackIsolatedNodes(TArray<FBALNode*>& Isolateds,
-	                              const TMap<UEdGraphNode*, FBALNode>& Proxies,
-	                              const FBALSettings& Settings);
-
-	// ── Helpers ───────────────────────────────────────────────
-
-	/** Compute the bounding box of all currently-placed exec nodes. */
-	static FBox2D ComputeGraphBounds(const TMap<UEdGraphNode*, FBALNode>& Proxies);
-
-	/** Total height of a Pure group when stacked with zero gap. */
-	static float PureGroupHeight(const TArray<FBALNode*>& Group);
-	static float PureGroupWidth (const TArray<FBALNode*>& Group);
+	static float EstimatePinOffset(const FBALNode& Node, const UEdGraphPin* Pin);
+	static float PureClusterHeight(const FBALNode& Consumer,
+	                               const TArray<FBALNode*>& OwnedPures,
+	                               EBALPureDir PureDir,
+	                               const FBALSettings& Settings);
+	static float PureLeftExtension(const TArray<FBALNode*>& OwnedPures,
+	                               const FBALSettings& Settings);
+	static void ClampSoftConstraint(FBALNode& Node);
+	static FBox2D ComponentBounds(const FBALComponent& Component,
+	                              const TMap<UEdGraphNode*, FBALNode>& Proxies);
 };

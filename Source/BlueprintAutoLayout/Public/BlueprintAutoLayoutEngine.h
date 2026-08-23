@@ -8,7 +8,7 @@
 class UEdGraph;
 
 /**
- * Main facade.  Orchestrates the five-stage pipeline:
+ * Main facade. Orchestrates the six-stage pipeline:
  *   ConstraintCollector → GraphAnalyzer → StyleVoter → LayoutSolver
  *     → CollisionResolver → Committer
  *

@@ -165,7 +165,7 @@ bool FBALTest_ExecTree_Fork::RunTest(const FString& /*Params*/)
 // ─────────────────────────────────────────────────────────────────────────────
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FBALTest_PureSubtreeAssignment,
-	"BlueprintAutoLayout.GraphAnalyzer.PureSubtreeAssignment",
+	"BlueprintAutoLayout.GraphAnalyzer.PureSubtreeAssignment.Chain",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
 bool FBALTest_PureSubtreeAssignment::RunTest(const FString& /*Params*/)

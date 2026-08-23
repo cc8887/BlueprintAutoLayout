@@ -9,6 +9,7 @@
 #include "Widgets/SWindow.h"
 #include "Widgets/SOverlay.h"
 #include "Widgets/SWidget.h"
+#include "Runtime/Launch/Resources/Version.h"
 
 void FOverlayWindowInjector::Init(FDrivenHighlightRegistry* InRegistry,
                                   FDrivenNodeRegistry*      InNodeRegistry)
@@ -101,7 +102,11 @@ void FOverlayWindowInjector::Attach(TSharedRef<SWindow> Window)
 	// Wrap the existing content in an SOverlay so the highlight overlay sits
 	// above whatever the editor put there. SWindow::SetContent replaces the
 	// previous content, which we put back into the SOverlay's first slot.
+#if ENGINE_MAJOR_VERSION >= 5
 	TSharedRef<SWidget> CurrentContent = Window->GetContent();
+#else
+	TSharedRef<SWidget> CurrentContent = ConstCastSharedRef<SWidget>(Window->GetContent());
+#endif
 
 	TSharedRef<SOverlay> Wrapper = SNew(SOverlay)
 		+ SOverlay::Slot()

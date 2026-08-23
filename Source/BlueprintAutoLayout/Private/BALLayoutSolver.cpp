@@ -2,416 +2,1460 @@
 // Copyright (c) 2026 ccc887. All Rights Reserved.
 
 #include "BALLayoutSolver.h"
+
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
-#include "BALGraphAnalyzer.h"
 
-// ─────────────────────────────────────────────────────────────
-//  Public: main solver
-// ─────────────────────────────────────────────────────────────
+namespace
+{
+	template<typename ElementType>
+	ElementType LayoutSolverPopNoShrink(TArray<ElementType>& Items)
+	{
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
+		return Items.Pop(EAllowShrinking::No);
+#else
+		return Items.Pop(false);
+#endif
+	}
+
+	bool IsMainDataNode(const FBALNode& Node)
+	{
+		return Node.Role == EBALNodeRole::Pure && Node.PureOwner == nullptr;
+	}
+
+	float EffectiveGap(float Requested, float Margin)
+	{
+		return FMath::Max(Requested, Margin * 2.f);
+	}
+
+	float Median(TArray<float>& Values, float Fallback)
+	{
+		if (Values.Num() == 0)
+		{
+			return Fallback;
+		}
+		Values.Sort();
+		const int32 Middle = Values.Num() / 2;
+		return Values.Num() % 2 == 0
+			? (Values[Middle - 1] + Values[Middle]) * 0.5f
+			: Values[Middle];
+	}
+
+	float EstimatePinOffsetLocal(const FBALNode& Node, const UEdGraphPin* Pin)
+	{
+		if (!Pin || !Node.GraphNode)
+		{
+			return Node.Size.Y * 0.5f;
+		}
+		int32 Count = 0;
+		int32 Index = 0;
+		for (const UEdGraphPin* Candidate : Node.GraphNode->Pins)
+		{
+			if (!Candidate || Candidate->Direction != Pin->Direction) continue;
+			if (Candidate == Pin) Index = Count;
+			++Count;
+		}
+		if (Count <= 0) return Node.Size.Y * 0.5f;
+		const float Header = FMath::Min(36.f, Node.Size.Y * 0.35f);
+		const float RowHeight = FMath::Max(18.f, (Node.Size.Y - Header) / static_cast<float>(Count));
+		return FMath::Clamp(
+			Header + (Index + 0.5f) * RowHeight,
+			8.f,
+			FMath::Max(8.f, Node.Size.Y - 8.f));
+	}
+
+	bool ContainsNode(const TSet<UEdGraphNode*>& Nodes, const FBALEdge& Edge)
+	{
+		return Nodes.Contains(Edge.Source) && Nodes.Contains(Edge.Target);
+	}
+
+	void MarkDataBackEdgesIterative(
+		UEdGraphNode* Root,
+		const TMap<UEdGraphNode*, TArray<int32>>& Outgoing,
+		TArray<FBALEdge>& Edges,
+		TMap<UEdGraphNode*, uint8>& Color)
+	{
+		struct FFrame
+		{
+			UEdGraphNode* Node;
+			int32 NextEdge;
+			FFrame(UEdGraphNode* InNode) : Node(InNode), NextEdge(0) {}
+		};
+
+		TArray<FFrame> Stack;
+		Color.FindChecked(Root) = 1;
+		Stack.Add(FFrame(Root));
+		while (Stack.Num() > 0)
+		{
+			FFrame& Frame = Stack.Last();
+			const TArray<int32>& NodeEdges = Outgoing.FindChecked(Frame.Node);
+			if (Frame.NextEdge >= NodeEdges.Num())
+			{
+				Color.FindChecked(Frame.Node) = 2;
+				LayoutSolverPopNoShrink(Stack);
+				continue;
+			}
+
+			FBALEdge& Edge = Edges[NodeEdges[Frame.NextEdge++]];
+			const uint8 TargetColor = Color.FindRef(Edge.Target);
+			if (TargetColor == 1)
+			{
+				Edge.bBackEdge = true;
+			}
+			else if (TargetColor == 0)
+			{
+				Color.FindChecked(Edge.Target) = 1;
+				Stack.Add(FFrame(Edge.Target));
+			}
+		}
+	}
+
+	void PlaceUnownedDataSinks(
+		TMap<UEdGraphNode*, FBALNode>& Proxies,
+		const TArray<FBALEdge>& Edges,
+		const FBALSettings& Settings)
+	{
+		TMap<UEdGraphNode*, TArray<int32>> DataOutgoing;
+		TMap<UEdGraphNode*, TArray<int32>> DataIncoming;
+		TMap<UEdGraphNode*, TArray<int32>> ExternalIncoming;
+		TMap<UEdGraphNode*, TArray<UEdGraphNode*>> WeakAdjacent;
+		TArray<UEdGraphNode*> Seeds;
+		TSet<UEdGraphNode*> SeedSet;
+		for (int32 EdgeIndex = 0; EdgeIndex < Edges.Num(); ++EdgeIndex)
+		{
+			const FBALEdge& Edge = Edges[EdgeIndex];
+			const FBALNode* Source = Proxies.Find(Edge.Source);
+			const FBALNode* Target = Proxies.Find(Edge.Target);
+			if (Edge.Kind != EBALEdgeKind::Data || Edge.bBackEdge || !Source || !Target
+				|| Target->Role != EBALNodeRole::Pure || Target->PureOwner != nullptr)
+			{
+				continue;
+			}
+
+			const bool bSourceIsUnowned =
+				Source->Role == EBALNodeRole::Pure && Source->PureOwner == nullptr;
+			if (bSourceIsUnowned)
+			{
+				DataOutgoing.FindOrAdd(Edge.Source).Add(EdgeIndex);
+				DataIncoming.FindOrAdd(Edge.Target).Add(EdgeIndex);
+				WeakAdjacent.FindOrAdd(Edge.Source).Add(Edge.Target);
+				WeakAdjacent.FindOrAdd(Edge.Target).Add(Edge.Source);
+			}
+			else if (Source->Role == EBALNodeRole::Exec
+				|| (Source->Role == EBALNodeRole::Pure && Source->PureOwner != nullptr))
+			{
+				ExternalIncoming.FindOrAdd(Edge.Target).Add(EdgeIndex);
+				DataOutgoing.FindOrAdd(Edge.Target);
+				DataIncoming.FindOrAdd(Edge.Target);
+				WeakAdjacent.FindOrAdd(Edge.Target);
+				if (!SeedSet.Contains(Edge.Target))
+				{
+					SeedSet.Add(Edge.Target);
+					Seeds.Add(Edge.Target);
+				}
+			}
+		}
+
+		for (TPair<UEdGraphNode*, TArray<int32>>& Pair : DataOutgoing)
+		{
+			Pair.Value.Sort([&Edges, &Proxies](int32 AIndex, int32 BIndex)
+			{
+				const FBALEdge& A = Edges[AIndex];
+				const FBALEdge& B = Edges[BIndex];
+				const int32 AStable = Proxies.FindChecked(A.Target).StableIndex;
+				const int32 BStable = Proxies.FindChecked(B.Target).StableIndex;
+				if (AStable != BStable) return AStable < BStable;
+				if (A.SourcePinIndex != B.SourcePinIndex) return A.SourcePinIndex < B.SourcePinIndex;
+				if (A.TargetPinIndex != B.TargetPinIndex) return A.TargetPinIndex < B.TargetPinIndex;
+				return AIndex < BIndex;
+			});
+		}
+		for (TPair<UEdGraphNode*, TArray<int32>>& Pair : DataIncoming)
+		{
+			Pair.Value.Sort([&Edges, &Proxies](int32 AIndex, int32 BIndex)
+			{
+				const FBALEdge& A = Edges[AIndex];
+				const FBALEdge& B = Edges[BIndex];
+				const int32 AStable = Proxies.FindChecked(A.Source).StableIndex;
+				const int32 BStable = Proxies.FindChecked(B.Source).StableIndex;
+				if (AStable != BStable) return AStable < BStable;
+				if (A.SourcePinIndex != B.SourcePinIndex) return A.SourcePinIndex < B.SourcePinIndex;
+				if (A.TargetPinIndex != B.TargetPinIndex) return A.TargetPinIndex < B.TargetPinIndex;
+				return AIndex < BIndex;
+			});
+		}
+		for (TPair<UEdGraphNode*, TArray<int32>>& Pair : ExternalIncoming)
+		{
+			Pair.Value.Sort([&Edges, &Proxies](int32 AIndex, int32 BIndex)
+			{
+				const FBALEdge& A = Edges[AIndex];
+				const FBALEdge& B = Edges[BIndex];
+				const int32 AStable = Proxies.FindChecked(A.Source).StableIndex;
+				const int32 BStable = Proxies.FindChecked(B.Source).StableIndex;
+				if (AStable != BStable) return AStable < BStable;
+				if (A.SourcePinIndex != B.SourcePinIndex) return A.SourcePinIndex < B.SourcePinIndex;
+				if (A.TargetPinIndex != B.TargetPinIndex) return A.TargetPinIndex < B.TargetPinIndex;
+				return AIndex < BIndex;
+			});
+		}
+		for (TPair<UEdGraphNode*, TArray<UEdGraphNode*>>& Pair : WeakAdjacent)
+		{
+			Pair.Value.Sort([&Proxies](const UEdGraphNode& A, const UEdGraphNode& B)
+			{
+				return Proxies.FindChecked(const_cast<UEdGraphNode*>(&A)).StableIndex
+					< Proxies.FindChecked(const_cast<UEdGraphNode*>(&B)).StableIndex;
+			});
+		}
+		Seeds.Sort([&Proxies](const UEdGraphNode& A, const UEdGraphNode& B)
+		{
+			return Proxies.FindChecked(const_cast<UEdGraphNode*>(&A)).StableIndex
+				< Proxies.FindChecked(const_cast<UEdGraphNode*>(&B)).StableIndex;
+		});
+
+		struct FSinkDfsFrame
+		{
+			UEdGraphNode* Node;
+			int32 NextEdge;
+			FSinkDfsFrame(UEdGraphNode* InNode) : Node(InNode), NextEdge(0) {}
+		};
+		TSet<int32> LocalBackEdges;
+		TSet<UEdGraphNode*> AssignedToRegion;
+		const float Gap = EffectiveGap(Settings.GapX, Settings.NodeMargin);
+		for (UEdGraphNode* Seed : Seeds)
+		{
+			if (AssignedToRegion.Contains(Seed)) continue;
+
+			TArray<UEdGraphNode*> RegionNodes;
+			TArray<UEdGraphNode*> RegionQueue;
+			TSet<UEdGraphNode*> RegionSet;
+			RegionQueue.Add(Seed);
+			RegionSet.Add(Seed);
+			AssignedToRegion.Add(Seed);
+			for (int32 Head = 0; Head < RegionQueue.Num(); ++Head)
+			{
+				UEdGraphNode* GraphNode = RegionQueue[Head];
+				RegionNodes.Add(GraphNode);
+				const TArray<UEdGraphNode*>* Adjacent = WeakAdjacent.Find(GraphNode);
+				if (!Adjacent) continue;
+				for (UEdGraphNode* Other : *Adjacent)
+				{
+					if (!RegionSet.Contains(Other))
+					{
+						RegionSet.Add(Other);
+						AssignedToRegion.Add(Other);
+						RegionQueue.Add(Other);
+					}
+				}
+			}
+			RegionNodes.Sort([&Proxies](const UEdGraphNode& A, const UEdGraphNode& B)
+			{
+				return Proxies.FindChecked(const_cast<UEdGraphNode*>(&A)).StableIndex
+					< Proxies.FindChecked(const_cast<UEdGraphNode*>(&B)).StableIndex;
+			});
+
+			// Exec-containing components do not pass through LayoutDataComponent, so
+			// classify data-cycle back edges locally before topological layering.
+			TMap<UEdGraphNode*, uint8> Color;
+			TArray<UEdGraphNode*> DfsRoots;
+			for (UEdGraphNode* GraphNode : RegionNodes)
+			{
+				Color.Add(GraphNode, 0);
+				if (SeedSet.Contains(GraphNode)) DfsRoots.Add(GraphNode);
+			}
+			for (UEdGraphNode* GraphNode : RegionNodes)
+			{
+				if (!SeedSet.Contains(GraphNode)) DfsRoots.Add(GraphNode);
+			}
+			for (UEdGraphNode* Root : DfsRoots)
+			{
+				if (Color.FindRef(Root) != 0) continue;
+				TArray<FSinkDfsFrame> Stack;
+				Color.FindChecked(Root) = 1;
+				Stack.Add(FSinkDfsFrame(Root));
+				while (Stack.Num() > 0)
+				{
+					FSinkDfsFrame& Frame = Stack.Last();
+					const TArray<int32>* Outgoing = DataOutgoing.Find(Frame.Node);
+					if (!Outgoing || Frame.NextEdge >= Outgoing->Num())
+					{
+						Color.FindChecked(Frame.Node) = 2;
+						LayoutSolverPopNoShrink(Stack);
+						continue;
+					}
+
+					const int32 EdgeIndex = (*Outgoing)[Frame.NextEdge++];
+					UEdGraphNode* TargetNode = Edges[EdgeIndex].Target;
+					if (!RegionSet.Contains(TargetNode)) continue;
+					const uint8 TargetColor = Color.FindRef(TargetNode);
+					if (TargetColor == 1)
+					{
+						LocalBackEdges.Add(EdgeIndex);
+					}
+					else if (TargetColor == 0)
+					{
+						Color.FindChecked(TargetNode) = 1;
+						Stack.Add(FSinkDfsFrame(TargetNode));
+					}
+				}
+			}
+
+			TMap<UEdGraphNode*, int32> Depths;
+			TMap<UEdGraphNode*, int32> InDegree;
+			for (UEdGraphNode* GraphNode : RegionNodes)
+			{
+				Depths.Add(GraphNode, 0);
+				InDegree.Add(GraphNode, 0);
+				const TArray<int32>* Incoming = DataIncoming.Find(GraphNode);
+				if (!Incoming) continue;
+				for (int32 EdgeIndex : *Incoming)
+				{
+					if (!LocalBackEdges.Contains(EdgeIndex)
+						&& RegionSet.Contains(Edges[EdgeIndex].Source))
+					{
+						++InDegree.FindChecked(GraphNode);
+					}
+				}
+			}
+
+			TArray<UEdGraphNode*> Ready;
+			for (UEdGraphNode* GraphNode : RegionNodes)
+			{
+				if (InDegree.FindRef(GraphNode) == 0) Ready.Add(GraphNode);
+			}
+			TArray<UEdGraphNode*> TopologicalOrder;
+			while (Ready.Num() > 0)
+			{
+				Ready.Sort([&Proxies](const UEdGraphNode& A, const UEdGraphNode& B)
+				{
+					return Proxies.FindChecked(const_cast<UEdGraphNode*>(&A)).StableIndex
+						< Proxies.FindChecked(const_cast<UEdGraphNode*>(&B)).StableIndex;
+				});
+				TArray<UEdGraphNode*> NextReady;
+				for (UEdGraphNode* SourceNode : Ready)
+				{
+					TopologicalOrder.Add(SourceNode);
+					const TArray<int32>* Outgoing = DataOutgoing.Find(SourceNode);
+					if (!Outgoing) continue;
+					for (int32 EdgeIndex : *Outgoing)
+					{
+						const FBALEdge& Edge = Edges[EdgeIndex];
+						if (LocalBackEdges.Contains(EdgeIndex) || !RegionSet.Contains(Edge.Target)) continue;
+						int32& TargetDepth = Depths.FindChecked(Edge.Target);
+						TargetDepth = FMath::Max(TargetDepth, Depths.FindRef(SourceNode) + 1);
+						int32& Degree = InDegree.FindChecked(Edge.Target);
+						--Degree;
+						if (Degree == 0) NextReady.Add(Edge.Target);
+					}
+				}
+				Ready = MoveTemp(NextReady);
+			}
+
+			auto EffectivePosition = [](const FBALNode& Node)
+			{
+				// Locked regions are restored after component anchoring. Keep every
+				// relative placement in the current layout coordinate space so that
+				// restoration translates the connected region exactly once.
+				if (Node.bLocked) return Node.OutPos;
+				if (!Node.bConstrained || Node.ConstraintType != EBALConstraintType::Soft
+					|| Node.MaxDrift < 0.f)
+				{
+					return Node.OutPos;
+				}
+				const FVector2D Delta = Node.OutPos - Node.OriginalPos;
+				const float Distance = Delta.Size();
+				return Distance > Node.MaxDrift && Distance > KINDA_SMALL_NUMBER
+					? Node.OriginalPos + Delta * (Node.MaxDrift / Distance)
+					: Node.OutPos;
+			};
+
+			float RegionRootX = -MAX_flt;
+			for (UEdGraphNode* GraphNode : RegionNodes)
+			{
+				const TArray<int32>* Incoming = ExternalIncoming.Find(GraphNode);
+				if (!Incoming) continue;
+				for (int32 EdgeIndex : *Incoming)
+				{
+					const FBALNode& Source = Proxies.FindChecked(Edges[EdgeIndex].Source);
+					RegionRootX = FMath::Max(
+						RegionRootX,
+						EffectivePosition(Source).X + Source.Size.X + Gap);
+				}
+			}
+
+			for (UEdGraphNode* GraphNode : TopologicalOrder)
+			{
+				FBALNode& Node = Proxies.FindChecked(GraphNode);
+				float X = Depths.FindRef(GraphNode) == 0 ? RegionRootX : -MAX_flt;
+				TArray<float> AlignedY;
+				const TArray<int32>* Incoming = DataIncoming.Find(GraphNode);
+				if (Incoming)
+				{
+					for (int32 EdgeIndex : *Incoming)
+					{
+						if (LocalBackEdges.Contains(EdgeIndex)) continue;
+						const FBALEdge& Edge = Edges[EdgeIndex];
+						const int32* SourceDepth = Depths.Find(Edge.Source);
+						if (!SourceDepth || *SourceDepth >= Depths.FindRef(GraphNode)) continue;
+						const FBALNode& Source = Proxies.FindChecked(Edge.Source);
+						const FVector2D SourcePosition = EffectivePosition(Source);
+						X = FMath::Max(X, SourcePosition.X + Source.Size.X + Gap);
+						AlignedY.Add(SourcePosition.Y + EstimatePinOffsetLocal(Source, Edge.SourcePin)
+							- EstimatePinOffsetLocal(Node, Edge.TargetPin));
+					}
+				}
+				const TArray<int32>* External = ExternalIncoming.Find(GraphNode);
+				if (External)
+				{
+					for (int32 EdgeIndex : *External)
+					{
+						const FBALEdge& Edge = Edges[EdgeIndex];
+						const FBALNode& Source = Proxies.FindChecked(Edge.Source);
+						const FVector2D SourcePosition = EffectivePosition(Source);
+						X = FMath::Max(X, SourcePosition.X + Source.Size.X + Gap);
+						AlignedY.Add(SourcePosition.Y + EstimatePinOffsetLocal(Source, Edge.SourcePin)
+							- EstimatePinOffsetLocal(Node, Edge.TargetPin));
+					}
+				}
+				if (!Node.bLocked && X > -MAX_flt * 0.5f)
+				{
+					Node.OutPos = FVector2D(X, Median(AlignedY, Node.OriginalPos.Y));
+					Node.OutPos = EffectivePosition(Node);
+				}
+			}
+		}
+	}
+
+	void AnchorFreeRegionsToLockedNodes(TMap<UEdGraphNode*, FBALNode>& Proxies)
+	{
+		TArray<FBALNode*> Ordered;
+		for (TPair<UEdGraphNode*, FBALNode>& Pair : Proxies)
+		{
+			if (!Pair.Value.bLocked && Pair.Value.Role != EBALNodeRole::Comment)
+			{
+				Ordered.Add(&Pair.Value);
+			}
+		}
+		Ordered.Sort([](const FBALNode& A, const FBALNode& B)
+		{
+			return A.StableIndex < B.StableIndex;
+		});
+
+		TSet<UEdGraphNode*> Visited;
+		for (FBALNode* Start : Ordered)
+		{
+			if (!Start || Visited.Contains(Start->GraphNode)) continue;
+			TArray<FBALNode*> Region;
+			TArray<FBALNode*> Queue;
+			Queue.Add(Start);
+			Visited.Add(Start->GraphNode);
+			FBALNode* BestLocked = nullptr;
+			float BestDistance = MAX_flt;
+			for (int32 Head = 0; Head < Queue.Num(); ++Head)
+			{
+				FBALNode* Node = Queue[Head];
+				Region.Add(Node);
+				for (UEdGraphPin* Pin : Node->GraphNode->Pins)
+				{
+					if (!Pin) continue;
+					for (UEdGraphPin* Linked : Pin->LinkedTo)
+					{
+						FBALNode* Other = Proxies.Find(Linked ? Linked->GetOwningNode() : nullptr);
+						if (!Other || Other->Role == EBALNodeRole::Comment) continue;
+						if (Other->bLocked)
+						{
+							const FVector2D Difference = Node->OriginalPos - Other->OriginalPos;
+							const float Distance = FMath::Abs(Difference.X) + FMath::Abs(Difference.Y);
+							if (!BestLocked || Distance < BestDistance
+								|| (FMath::IsNearlyEqual(Distance, BestDistance)
+									&& Other->StableIndex < BestLocked->StableIndex))
+							{
+								BestLocked = Other;
+								BestDistance = Distance;
+							}
+						}
+						else if (!Visited.Contains(Other->GraphNode))
+						{
+							Visited.Add(Other->GraphNode);
+							Queue.Add(Other);
+						}
+					}
+				}
+			}
+			if (BestLocked)
+			{
+				const FVector2D Delta = BestLocked->OriginalPos - BestLocked->OutPos;
+				for (FBALNode* Node : Region) Node->OutPos += Delta;
+			}
+		}
+	}
+}
 
 void FBALLayoutSolver::Solve(const FSolverInput& Input)
 {
-	if (!Input.Proxies || !Input.ExecRoots || !Input.Settings) return;
-
-	const FBALSettings& S = *Input.Settings;
-
-	// ── Pass 1: Exec chain ───────────────────────────────────
-
-	// Compute subtree heights bottom-up
-	for (FBALExecNode* Root : *Input.ExecRoots)
+	if (!Input.Proxies || !Input.Edges || !Input.Components || !Input.Settings)
 	{
-		ComputeSubtreeHeight(Root, Input.PureDir, S);
+		return;
 	}
 
-	// Assign coordinates top-down
-	// Stack multiple roots vertically
-	float CurY = 0.f;
-	for (FBALExecNode* Root : *Input.ExecRoots)
+	TMap<UEdGraphNode*, FBALNode>& Proxies = *Input.Proxies;
+	TArray<FBALEdge>& Edges = *Input.Edges;
+	TArray<FBALComponent>& Components = *Input.Components;
+	const FBALSettings& Settings = *Input.Settings;
+	TMap<UEdGraphNode*, TArray<FBALNode*>> OwnedPuresByConsumer;
+	for (TPair<UEdGraphNode*, FBALNode>& Pair : Proxies)
 	{
-		// Skip locked roots — use their original position as the anchor
-		if (Root->Proxy->bLocked)
+		FBALNode& Node = Pair.Value;
+		if (Node.Role == EBALNodeRole::Pure && Node.PureOwner != nullptr)
 		{
-			CurY = FMath::Max(CurY,
-			                  Root->Proxy->OriginalPos.Y + Root->SubtreeH + S.GapY);
-			AssignExecCoords(Root, Root->Proxy->OriginalPos.X,
-			                 Root->Proxy->OriginalPos.Y, Input.PureDir, S);
+			OwnedPuresByConsumer.FindOrAdd(Node.PureOwner).Add(&Node);
+		}
+	}
+
+	for (FBALComponent& Component : Components)
+	{
+		bool bHasExec = false;
+		bool bHasData = false;
+		for (UEdGraphNode* Node : Component.Nodes)
+		{
+			const FBALNode& Proxy = Proxies.FindChecked(Node);
+			bHasExec = bHasExec || Proxy.Role == EBALNodeRole::Exec;
+			bHasData = bHasData || IsMainDataNode(Proxy);
+		}
+
+		if (bHasExec)
+		{
+			LayoutExecComponent(
+				Component,
+				Proxies,
+				Edges,
+				OwnedPuresByConsumer,
+				Input.PureDir,
+				Settings);
+		}
+		else if (bHasData)
+		{
+			LayoutDataComponent(Component, Proxies, Edges, Settings);
+		}
+	}
+
+	PlacePureGroups(Proxies, Edges, OwnedPuresByConsumer, Input.PureDir, Settings);
+	PlaceUnownedDataSinks(Proxies, Edges, Settings);
+	PlaceKnotNodes(Proxies, Settings);
+	PreserveComponentAnchors(Components, Proxies, Settings);
+	PackOverlappingComponents(Components, Proxies, Settings);
+	AnchorFreeRegionsToLockedNodes(Proxies);
+
+	for (TPair<UEdGraphNode*, FBALNode>& Pair : Proxies)
+	{
+		FBALNode& Node = Pair.Value;
+		if (Node.bLocked)
+		{
+			Node.OutPos = Node.OriginalPos;
 		}
 		else
 		{
-			AssignExecCoords(Root, 0.f, CurY, Input.PureDir, S);
-			CurY += Root->SubtreeH + S.GapY * 2.f;
+			ClampSoftConstraint(Node);
 		}
 	}
 
-	// ── Pass 2: Pure groups ──────────────────────────────────
-	PlacePureGroups(*Input.Proxies, *Input.ExecRoots, Input.PureDir, S);
-
-	// ── Pass 3: Isolated nodes ───────────────────────────────
-	if (Input.IsolatedPures && Input.IsolatedNodes)
+	// A caller-supplied rigid group follows the layout as one translated body.
+	// Use the mean desired translation so no individual member is privileged.
+	TMap<int32, FVector2D> TranslationSums;
+	TMap<int32, int32> TranslationCounts;
+	TSet<int32> LockedGroups;
+	TArray<FBALNode*> RigidOrder;
+	for (TPair<UEdGraphNode*, FBALNode>& Pair : Proxies)
 	{
-		TArray<FBALNode*> AllIsolated;
-		AllIsolated.Append(*Input.IsolatedPures);
-		AllIsolated.Append(*Input.IsolatedNodes);
-		PackIsolatedNodes(AllIsolated, *Input.Proxies, S);
-	}
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Pass 1 helpers: subtree height (bottom-up)
-// ─────────────────────────────────────────────────────────────
-
-float FBALLayoutSolver::ComputeSubtreeHeight(FBALExecNode* Node,
-                                              EBALPureDir PureDir,
-                                              const FBALSettings& S)
-{
-	float OwnHeight = Node->Proxy->Size.Y + PureReservedHeight(Node, PureDir, S);
-
-	if (Node->Children.IsEmpty())
-	{
-		Node->SubtreeH = OwnHeight;
-		return Node->SubtreeH;
-	}
-
-	if (Node->Children.Num() == 1)
-	{
-		// Linear — height is max of own and child
-		float ChildH = ComputeSubtreeHeight(Node->Children[0], PureDir, S);
-		Node->SubtreeH = FMath::Max(OwnHeight, ChildH);
-		return Node->SubtreeH;
-	}
-
-	// Fork — sum children heights + gaps
-	float TotalChildH = 0.f;
-	for (FBALExecNode* Child : Node->Children)
-	{
-		TotalChildH += ComputeSubtreeHeight(Child, PureDir, S);
-	}
-	TotalChildH += S.GapY * (Node->Children.Num() - 1);
-
-	Node->SubtreeH = FMath::Max(OwnHeight, TotalChildH);
-	return Node->SubtreeH;
-}
-
-float FBALLayoutSolver::PureReservedHeight(const FBALExecNode* Node,
-                                            EBALPureDir PureDir,
-                                            const FBALSettings& S)
-{
-	// Only North/South Pure placement adds to the vertical footprint
-	if (PureDir != EBALPureDir::North && PureDir != EBALPureDir::South)
-		return 0.f;
-
-	return PureGroupHeight(Node->PureGroup) + S.GapY;
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Pass 1 helpers: coordinate assignment (top-down)
-// ─────────────────────────────────────────────────────────────
-
-void FBALLayoutSolver::AssignExecCoords(FBALExecNode* Node,
-                                         float X, float Y,
-                                         EBALPureDir PureDir,
-                                         const FBALSettings& S)
-{
-	if (!Node || !Node->Proxy) return;
-
-	// Locked nodes keep their original position but we still recurse children
-	if (!Node->Proxy->bLocked)
-	{
-		// Vertically center the node within its allocated SubtreeH band
-		float CenterY = Y + (Node->SubtreeH - Node->Proxy->Size.Y) * 0.5f;
-		Node->Proxy->OutPos = FVector2D(X, CenterY);
-	}
-
-	float NextX = Node->Proxy->OutPos.X + Node->Proxy->Size.X + S.GapX;
-
-	if (Node->Children.Num() == 0)
-	{
-		// Leaf — nothing more
-	}
-	else if (Node->Children.Num() == 1)
-	{
-		// Linear segment — same Y band start
-		AssignExecCoords(Node->Children[0], NextX, Y, PureDir, S);
-	}
-	else
-	{
-		// Fork — distribute children into vertical bands
-		float CurY = Y;
-		for (FBALExecNode* Child : Node->Children)
+		if (Pair.Value.GroupId != INDEX_NONE)
 		{
-			AssignExecCoords(Child, NextX, CurY, PureDir, S);
-			CurY += Child->SubtreeH + S.GapY;
+			RigidOrder.Add(&Pair.Value);
 		}
 	}
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Pass 2: Pure group stacking
-// ─────────────────────────────────────────────────────────────
-
-void FBALLayoutSolver::PlacePureGroups(TMap<UEdGraphNode*, FBALNode>& Proxies,
-                                        TArray<FBALExecNode*>& ExecRoots,
-                                        EBALPureDir PureDir,
-                                        const FBALSettings& S)
-{
-	TFunction<void(FBALExecNode*)> Traverse = [&](FBALExecNode* EN)
+	RigidOrder.Sort([](const FBALNode& A, const FBALNode& B)
 	{
-		if (!EN) return;
-
-		if (EN->PureGroup.Num() > 0)
-		{
-			SortPureGroup(EN->PureGroup, *EN->Proxy);
-			StackPureGroup(EN->PureGroup, *EN->Proxy, PureDir, S);
-		}
-
-		for (FBALExecNode* Child : EN->Children) Traverse(Child);
-	};
-
-	for (FBALExecNode* Root : ExecRoots) Traverse(Root);
-}
-
-void FBALLayoutSolver::SortPureGroup(TArray<FBALNode*>& Group,
-                                      const FBALNode& Consumer)
-{
-	// Sort by:
-	//   1. PureDepth ascending (shallowest / most-direct first)
-	//   2. Within same depth: consumer input pin Y position (minimises crossings)
-	//      Approximate using OriginalPos.Y of the Pure node
-	//   3. Width descending (wider nodes at the bottom to avoid blocking wires)
-	Group.Sort([](const FBALNode& A, const FBALNode& B)
-	{
-		if (A.PureDepth != B.PureDepth)
-			return A.PureDepth < B.PureDepth;
-		// proxy original Y as consumer pin position approximation
-		if (!FMath::IsNearlyEqual(A.OriginalPos.Y, B.OriginalPos.Y, 1.0))
-			return A.OriginalPos.Y < B.OriginalPos.Y;
-		return A.Size.X > B.Size.X; // wider first at bottom => sort descending = put smaller on top
+		return A.StableIndex < B.StableIndex;
 	});
+	for (const FBALNode* NodePtr : RigidOrder)
+	{
+		const FBALNode& Node = *NodePtr;
+		if (Node.bLocked && Node.GroupId != INDEX_NONE)
+		{
+			LockedGroups.Add(Node.GroupId);
+		}
+		if (Node.bLocked || !Node.bConstrained
+			|| Node.ConstraintType != EBALConstraintType::RigidGroup
+			|| Node.GroupId == INDEX_NONE)
+		{
+			continue;
+		}
+		const FVector2D Delta = Node.OutPos - Node.OriginalPos;
+		if (FVector2D* Sum = TranslationSums.Find(Node.GroupId))
+		{
+			*Sum += Delta;
+		}
+		else
+		{
+			TranslationSums.Add(Node.GroupId, Delta);
+		}
+		++TranslationCounts.FindOrAdd(Node.GroupId);
+	}
+	for (TPair<UEdGraphNode*, FBALNode>& Pair : Proxies)
+	{
+		FBALNode& Node = Pair.Value;
+		const int32 Count = TranslationCounts.FindRef(Node.GroupId);
+		if (Node.GroupId != INDEX_NONE && LockedGroups.Contains(Node.GroupId))
+		{
+			Node.OutPos = Node.OriginalPos;
+		}
+		else if (!Node.bLocked && Node.bConstrained
+			&& Node.ConstraintType == EBALConstraintType::RigidGroup
+			&& Node.GroupId != INDEX_NONE && Count > 0)
+		{
+			Node.OutPos = Node.OriginalPos + TranslationSums.FindRef(Node.GroupId) / static_cast<float>(Count);
+		}
+	}
 }
 
-void FBALLayoutSolver::StackPureGroup(const TArray<FBALNode*>& Group,
-                                       const FBALNode& Consumer,
-                                       EBALPureDir Dir,
-                                       const FBALSettings& S)
+void FBALLayoutSolver::LayoutExecComponent(
+	const FBALComponent& Component,
+	TMap<UEdGraphNode*, FBALNode>& Proxies,
+	TArray<FBALEdge>& Edges,
+	const TMap<UEdGraphNode*, TArray<FBALNode*>>& OwnedPuresByConsumer,
+	EBALPureDir PureDir,
+	const FBALSettings& Settings)
 {
-	if (Group.IsEmpty()) return;
-
-	// Compute total group dimensions grouped by PureDepth layer
-	// depth 0 = closest to consumer, depth 1 = next layer out, etc.
-	int32 MaxDepth = 0;
-	for (const FBALNode* P : Group)
-		MaxDepth = FMath::Max(MaxDepth, P->PureDepth);
-
-	// For each depth layer compute the column width (widest node in that layer)
-	TArray<float> LayerWidth;
-	LayerWidth.SetNumZeroed(MaxDepth + 1);
-	TArray<float> LayerHeight;
-	LayerHeight.SetNumZeroed(MaxDepth + 1);
-
-	for (const FBALNode* P : Group)
+	int32 MaxLayer = 0;
+	TArray<FBALNode*> ExecNodes;
+	for (UEdGraphNode* Node : Component.Nodes)
 	{
-		LayerWidth[P->PureDepth]  = FMath::Max(LayerWidth[P->PureDepth],  P->Size.X);
-		LayerHeight[P->PureDepth] += P->Size.Y; // stacked tightly, no gap
-	}
-
-	// Place each layer
-	// For West direction: depth 0 is rightmost (adjacent to consumer), deeper = further left
-	// For East direction: depth 0 is leftmost (adjacent to consumer), deeper = further right
-	// For North/South:  depth 0 is closest (largest Y-wise offset), layers stack outward
-
-	// Compute total height of depth-0 layer (the tallest is what we center on)
-	float TotalH0 = LayerHeight[0];
-	float ConsumerCenterY = Consumer.OutPos.Y + Consumer.Size.Y * 0.5f;
-
-	switch (Dir)
-	{
-	case EBALPureDir::West:
-	{
-		// Depth-0 column is at Consumer.X - LayerWidth[0] - GapX
-		// Each deeper layer goes further left
-		float LayerX = Consumer.OutPos.X - LayerWidth[0] - S.GapX;
-		for (int32 Depth = 0; Depth <= MaxDepth; ++Depth)
+		FBALNode& Proxy = Proxies.FindChecked(Node);
+		if (Proxy.Role == EBALNodeRole::Exec)
 		{
-			float LayerStartY = ConsumerCenterY - LayerHeight[Depth] * 0.5f;
-			float CurY = LayerStartY;
-
-			for (FBALNode* P : Group)
-			{
-				if (P->PureDepth != Depth) continue;
-				if (P->bLocked) continue; // never move locked nodes
-
-				// Right-align within the column so output pins touch the next layer
-				float NodeX = LayerX + LayerWidth[Depth] - P->Size.X;
-				P->OutPos = FVector2D(NodeX, CurY);
-				CurY += P->Size.Y; // zero gap — stacked tightly
-			}
-
-			if (Depth < MaxDepth)
-				LayerX -= LayerWidth[Depth + 1] + S.PureGapX;
+			ExecNodes.Add(&Proxy);
+			MaxLayer = FMath::Max(MaxLayer, Proxy.Layer);
 		}
-		break;
 	}
-
-	case EBALPureDir::East:
+	if (ExecNodes.Num() == 0)
 	{
-		float LayerX = Consumer.OutPos.X + Consumer.Size.X + S.GapX;
-		for (int32 Depth = 0; Depth <= MaxDepth; ++Depth)
-		{
-			float LayerStartY = ConsumerCenterY - LayerHeight[Depth] * 0.5f;
-			float CurY = LayerStartY;
-
-			for (FBALNode* P : Group)
-			{
-				if (P->PureDepth != Depth) continue;
-				if (P->bLocked) continue;
-				P->OutPos = FVector2D(LayerX, CurY);
-				CurY += P->Size.Y;
-			}
-
-			if (Depth < MaxDepth)
-				LayerX += LayerWidth[Depth] + S.PureGapX;
-		}
-		break;
+		return;
 	}
 
-	case EBALPureDir::North:
+	TArray<TArray<FBALNode*>> Layers;
+	Layers.SetNum(MaxLayer + 1);
+	for (FBALNode* Node : ExecNodes)
 	{
-		// Stack vertically above consumer; depth 0 is closest (highest Y = just above)
-		float LayerY = Consumer.OutPos.Y - LayerHeight[0] - S.GapY;
-		float ConsumerCenterX = Consumer.OutPos.X + Consumer.Size.X * 0.5f;
-
-		for (int32 Depth = 0; Depth <= MaxDepth; ++Depth)
-		{
-			float TotalW = 0.f;
-			for (const FBALNode* P : Group)
-				if (P->PureDepth == Depth) TotalW += P->Size.X;
-
-			float CurX = ConsumerCenterX - TotalW * 0.5f;
-
-			for (FBALNode* P : Group)
-			{
-				if (P->PureDepth != Depth) continue;
-				if (P->bLocked) continue;
-				P->OutPos = FVector2D(CurX, LayerY);
-				CurX += P->Size.X;
-			}
-
-			if (Depth < MaxDepth)
-				LayerY -= LayerHeight[Depth + 1] + S.GapY;
-		}
-		break;
+		Layers[Node->Layer].Add(Node);
 	}
-
-	case EBALPureDir::South:
+	for (TArray<FBALNode*>& Layer : Layers)
 	{
-		float LayerY = Consumer.OutPos.Y + Consumer.Size.Y + S.GapY;
-		float ConsumerCenterX = Consumer.OutPos.X + Consumer.Size.X * 0.5f;
-
-		for (int32 Depth = 0; Depth <= MaxDepth; ++Depth)
+		Layer.Sort([](const FBALNode& A, const FBALNode& B)
 		{
-			float TotalW = 0.f;
-			for (const FBALNode* P : Group)
-				if (P->PureDepth == Depth) TotalW += P->Size.X;
-
-			float CurX = ConsumerCenterX - TotalW * 0.5f;
-
-			for (FBALNode* P : Group)
+			if (A.OriginalPos.Y != B.OriginalPos.Y)
 			{
-				if (P->PureDepth != Depth) continue;
-				if (P->bLocked) continue;
-				P->OutPos = FVector2D(CurX, LayerY);
-				CurX += P->Size.X;
+				return A.OriginalPos.Y < B.OriginalPos.Y;
 			}
-
-			if (Depth < MaxDepth)
-				LayerY += LayerHeight[Depth] + S.GapY;
-		}
-		break;
+			return A.StableIndex < B.StableIndex;
+		});
 	}
+	ReduceCrossings(Layers, Edges, Settings);
+
+	TMap<UEdGraphNode*, float> ClusterHeights;
+	TArray<float> LayerWidths;
+	TArray<float> LeftExtensions;
+	TArray<float> RightExtensions;
+	LayerWidths.SetNumZeroed(Layers.Num());
+	LeftExtensions.SetNumZeroed(Layers.Num());
+	RightExtensions.SetNumZeroed(Layers.Num());
+	for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
+	{
+		for (FBALNode* Node : Layers[LayerIndex])
+		{
+			LayerWidths[LayerIndex] = FMath::Max(LayerWidths[LayerIndex], Node->Size.X);
+			const TArray<FBALNode*>* OwnedPures = OwnedPuresByConsumer.Find(Node->GraphNode);
+			const float ClusterHeight = OwnedPures
+				? PureClusterHeight(*Node, *OwnedPures, PureDir, Settings)
+				: Node->Size.Y;
+			const float Extension = OwnedPures
+				? PureLeftExtension(*OwnedPures, Settings)
+				: 0.f;
+			ClusterHeights.Add(Node->GraphNode, ClusterHeight);
+			if (PureDir == EBALPureDir::West)
+			{
+				LeftExtensions[LayerIndex] = FMath::Max(LeftExtensions[LayerIndex], Extension);
+			}
+			else if (PureDir == EBALPureDir::East)
+			{
+				RightExtensions[LayerIndex] = FMath::Max(RightExtensions[LayerIndex], Extension);
+			}
+		}
+	}
+
+	TArray<float> LayerX;
+	LayerX.SetNumZeroed(Layers.Num());
+	for (int32 LayerIndex = 1; LayerIndex < Layers.Num(); ++LayerIndex)
+	{
+		LayerX[LayerIndex] = LayerX[LayerIndex - 1]
+			+ LayerWidths[LayerIndex - 1]
+			+ EffectiveGap(Settings.GapX, Settings.NodeMargin)
+			+ RightExtensions[LayerIndex - 1]
+			+ LeftExtensions[LayerIndex];
+	}
+
+	for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
+	{
+		float CursorY = 0.f;
+		for (int32 Order = 0; Order < Layers[LayerIndex].Num(); ++Order)
+		{
+			FBALNode* Node = Layers[LayerIndex][Order];
+			const float ClusterHeight = ClusterHeights.FindRef(Node->GraphNode);
+			Node->LayerOrder = Order;
+			Node->OutPos = FVector2D(
+				LayerX[LayerIndex],
+				CursorY + (ClusterHeight - Node->Size.Y) * 0.5f);
+			CursorY += ClusterHeight + EffectiveGap(Settings.GapY, Settings.NodeMargin);
+		}
+	}
+
+	if (Settings.bAlignExecPins)
+	{
+		AlignLayers(Layers, Edges, ClusterHeights, Settings);
 	}
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Pass 3: isolated node packing
-// ─────────────────────────────────────────────────────────────
-
-void FBALLayoutSolver::PackIsolatedNodes(TArray<FBALNode*>& Isolateds,
-                                          const TMap<UEdGraphNode*, FBALNode>& Proxies,
-                                          const FBALSettings& S)
+void FBALLayoutSolver::LayoutDataComponent(
+	const FBALComponent& Component,
+	TMap<UEdGraphNode*, FBALNode>& Proxies,
+	TArray<FBALEdge>& Edges,
+	const FBALSettings& Settings)
 {
-	if (Isolateds.IsEmpty()) return;
-
-	FBox2D GraphBounds = ComputeGraphBounds(Proxies);
-
-	// Place the isolated block in the bottom-right corner
-	float StartX = GraphBounds.Max.X + S.GapX * 4.f;
-	float StartY = GraphBounds.Max.Y + S.GapY * 4.f;
-
-	// Simple row-wrapping layout with a max row width of 1200px
-	const float MaxRowWidth = 1200.f;
-	float CurX = StartX;
-	float CurY = StartY;
-	float RowMaxH = 0.f;
-
-	for (FBALNode* N : Isolateds)
+	TArray<FBALNode*> Nodes;
+	TSet<UEdGraphNode*> NodeSet;
+	for (UEdGraphNode* GraphNode : Component.Nodes)
 	{
-		if (N->bLocked) continue;
-
-		if (CurX + N->Size.X > StartX + MaxRowWidth && CurX > StartX)
+		FBALNode& Proxy = Proxies.FindChecked(GraphNode);
+		if (IsMainDataNode(Proxy))
 		{
-			// Wrap to next row
-			CurX = StartX;
-			CurY += RowMaxH + S.GapY;
-			RowMaxH = 0.f;
+			Nodes.Add(&Proxy);
+			NodeSet.Add(GraphNode);
+			Proxy.Layer = 0;
 		}
+	}
+	if (Nodes.Num() == 0)
+	{
+		return;
+	}
 
-		N->OutPos = FVector2D(CurX, CurY);
-		CurX += N->Size.X + S.GapX;
-		RowMaxH = FMath::Max(RowMaxH, N->Size.Y);
+	TMap<UEdGraphNode*, TArray<int32>> Outgoing;
+	TMap<UEdGraphNode*, uint8> Color;
+	for (FBALNode* Node : Nodes)
+	{
+		Outgoing.Add(Node->GraphNode, TArray<int32>());
+		Color.Add(Node->GraphNode, 0);
+	}
+	for (int32 EdgeIndex = 0; EdgeIndex < Edges.Num(); ++EdgeIndex)
+	{
+		FBALEdge& Edge = Edges[EdgeIndex];
+		if (Edge.Kind == EBALEdgeKind::Data && ContainsNode(NodeSet, Edge))
+		{
+			Outgoing.FindChecked(Edge.Source).Add(EdgeIndex);
+		}
+	}
+	for (TPair<UEdGraphNode*, TArray<int32>>& Pair : Outgoing)
+	{
+		Pair.Value.Sort([&Edges, &Proxies](int32 AIndex, int32 BIndex)
+		{
+			const FBALEdge& A = Edges[AIndex];
+			const FBALEdge& B = Edges[BIndex];
+			if (A.SourcePinIndex != B.SourcePinIndex) return A.SourcePinIndex < B.SourcePinIndex;
+			const int32 ATarget = Proxies.FindChecked(A.Target).StableIndex;
+			const int32 BTarget = Proxies.FindChecked(B.Target).StableIndex;
+			if (ATarget != BTarget) return ATarget < BTarget;
+			if (A.TargetPinIndex != B.TargetPinIndex) return A.TargetPinIndex < B.TargetPinIndex;
+			return AIndex < BIndex;
+		});
+	}
+
+	Nodes.Sort([](const FBALNode& A, const FBALNode& B) { return A.StableIndex < B.StableIndex; });
+	for (FBALNode* Node : Nodes)
+	{
+		if (Color.FindRef(Node->GraphNode) == 0)
+		{
+			MarkDataBackEdgesIterative(Node->GraphNode, Outgoing, Edges, Color);
+		}
+	}
+
+	TMap<UEdGraphNode*, int32> InDegree;
+	for (FBALNode* Node : Nodes)
+	{
+		InDegree.Add(Node->GraphNode, 0);
+	}
+	for (const FBALEdge& Edge : Edges)
+	{
+		if (Edge.Kind == EBALEdgeKind::Data && !Edge.bBackEdge && ContainsNode(NodeSet, Edge))
+		{
+			++InDegree.FindChecked(Edge.Target);
+		}
+	}
+
+	TArray<UEdGraphNode*> Ready;
+	for (FBALNode* Node : Nodes)
+	{
+		if (InDegree.FindRef(Node->GraphNode) == 0)
+		{
+			Ready.Add(Node->GraphNode);
+		}
+	}
+	while (Ready.Num() > 0)
+	{
+		Ready.Sort([&Proxies](const UEdGraphNode& A, const UEdGraphNode& B)
+		{
+			return Proxies.FindChecked(const_cast<UEdGraphNode*>(&A)).StableIndex
+				< Proxies.FindChecked(const_cast<UEdGraphNode*>(&B)).StableIndex;
+		});
+		UEdGraphNode* Node = Ready[0];
+		Ready.RemoveAt(0);
+		for (int32 EdgeIndex : Outgoing.FindChecked(Node))
+		{
+			const FBALEdge& Edge = Edges[EdgeIndex];
+			if (Edge.bBackEdge) continue;
+			FBALNode& Target = Proxies.FindChecked(Edge.Target);
+			Target.Layer = FMath::Max(Target.Layer, Proxies.FindChecked(Node).Layer + 1);
+			int32& Degree = InDegree.FindChecked(Edge.Target);
+			--Degree;
+			if (Degree == 0) Ready.Add(Edge.Target);
+		}
+	}
+
+	int32 MaxLayer = 0;
+	for (FBALNode* Node : Nodes) MaxLayer = FMath::Max(MaxLayer, Node->Layer);
+	TArray<TArray<FBALNode*>> Layers;
+	Layers.SetNum(MaxLayer + 1);
+	for (FBALNode* Node : Nodes) Layers[Node->Layer].Add(Node);
+	for (TArray<FBALNode*>& Layer : Layers)
+	{
+		Layer.Sort([](const FBALNode& A, const FBALNode& B)
+		{
+			if (A.OriginalPos.Y != B.OriginalPos.Y) return A.OriginalPos.Y < B.OriginalPos.Y;
+			return A.StableIndex < B.StableIndex;
+		});
+	}
+	ReduceCrossings(Layers, Edges, Settings);
+
+	TArray<float> Widths;
+	TArray<float> X;
+	Widths.SetNumZeroed(Layers.Num());
+	X.SetNumZeroed(Layers.Num());
+	for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
+	{
+		for (FBALNode* Node : Layers[LayerIndex]) Widths[LayerIndex] = FMath::Max(Widths[LayerIndex], Node->Size.X);
+		if (LayerIndex > 0)
+		{
+			X[LayerIndex] = X[LayerIndex - 1] + Widths[LayerIndex - 1]
+				+ EffectiveGap(Settings.GapX, Settings.NodeMargin);
+		}
+	}
+	TMap<UEdGraphNode*, float> Heights;
+	for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
+	{
+		float CursorY = 0.f;
+		for (int32 Order = 0; Order < Layers[LayerIndex].Num(); ++Order)
+		{
+			FBALNode* Node = Layers[LayerIndex][Order];
+			Node->LayerOrder = Order;
+			Node->OutPos = FVector2D(X[LayerIndex], CursorY);
+			Heights.Add(Node->GraphNode, Node->Size.Y);
+			CursorY += Node->Size.Y + EffectiveGap(Settings.GapY, Settings.NodeMargin);
+		}
+	}
+	AlignLayers(Layers, Edges, Heights, Settings);
+}
+
+void FBALLayoutSolver::ReduceCrossings(
+	TArray<TArray<FBALNode*>>& Layers,
+	const TArray<FBALEdge>& Edges,
+	const FBALSettings& Settings)
+{
+	TMap<UEdGraphNode*, FBALNode*> NodeMap;
+	for (TArray<FBALNode*>& Layer : Layers)
+	{
+		for (int32 Index = 0; Index < Layer.Num(); ++Index)
+		{
+			Layer[Index]->LayerOrder = Index;
+			NodeMap.Add(Layer[Index]->GraphNode, Layer[Index]);
+		}
+	}
+	TMap<UEdGraphNode*, TArray<const FBALEdge*>> Incoming;
+	TMap<UEdGraphNode*, TArray<const FBALEdge*>> Outgoing;
+	for (const FBALEdge& Edge : Edges)
+	{
+		if (Edge.bBackEdge || !NodeMap.Contains(Edge.Source) || !NodeMap.Contains(Edge.Target))
+		{
+			continue;
+		}
+		Incoming.FindOrAdd(Edge.Target).Add(&Edge);
+		Outgoing.FindOrAdd(Edge.Source).Add(&Edge);
+	}
+	for (TPair<UEdGraphNode*, TArray<const FBALEdge*>>& Pair : Incoming)
+	{
+		Pair.Value.Sort([&NodeMap](const FBALEdge& A, const FBALEdge& B)
+		{
+			const int32 AStable = NodeMap.FindChecked(A.Source)->StableIndex;
+			const int32 BStable = NodeMap.FindChecked(B.Source)->StableIndex;
+			if (AStable != BStable) return AStable < BStable;
+			if (A.SourcePinIndex != B.SourcePinIndex) return A.SourcePinIndex < B.SourcePinIndex;
+			return A.TargetPinIndex < B.TargetPinIndex;
+		});
+	}
+	for (TPair<UEdGraphNode*, TArray<const FBALEdge*>>& Pair : Outgoing)
+	{
+		Pair.Value.Sort([&NodeMap](const FBALEdge& A, const FBALEdge& B)
+		{
+			const int32 AStable = NodeMap.FindChecked(A.Target)->StableIndex;
+			const int32 BStable = NodeMap.FindChecked(B.Target)->StableIndex;
+			if (AStable != BStable) return AStable < BStable;
+			if (A.TargetPinIndex != B.TargetPinIndex) return A.TargetPinIndex < B.TargetPinIndex;
+			return A.SourcePinIndex < B.SourcePinIndex;
+		});
+	}
+
+	const int32 PassCount = FMath::Max(0, Settings.CrossingReductionPasses);
+	for (int32 Pass = 0; Pass < PassCount; ++Pass)
+	{
+		const bool bForward = Pass % 2 == 0;
+		const int32 Start = bForward ? 1 : Layers.Num() - 2;
+		const int32 End = bForward ? Layers.Num() : -1;
+		const int32 Step = bForward ? 1 : -1;
+		for (int32 LayerIndex = Start; LayerIndex != End; LayerIndex += Step)
+		{
+			if (!Layers.IsValidIndex(LayerIndex)) continue;
+			TMap<FBALNode*, int32> ScoreKeys;
+			TMap<FBALNode*, int32> PreviousOrder;
+			for (FBALNode* Node : Layers[LayerIndex])
+			{
+				float NeighborOrderSum = 0.f;
+				int32 NeighborCount = 0;
+				const TArray<const FBALEdge*>* NeighborEdges = bForward
+					? Incoming.Find(Node->GraphNode)
+					: Outgoing.Find(Node->GraphNode);
+				if (NeighborEdges)
+				{
+					for (const FBALEdge* Edge : *NeighborEdges)
+					{
+						if (!Edge) continue;
+						if (bForward)
+						{
+							const FBALNode* Source = NodeMap.FindRef(Edge->Source);
+							if (Source && Source->Layer < Node->Layer)
+							{
+								NeighborOrderSum +=
+									static_cast<float>(Source->LayerOrder) + Edge->SourcePinIndex * 0.01f;
+								++NeighborCount;
+							}
+						}
+						else
+						{
+							const FBALNode* Target = NodeMap.FindRef(Edge->Target);
+							if (Target && Target->Layer > Node->Layer)
+							{
+								NeighborOrderSum +=
+									static_cast<float>(Target->LayerOrder) + Edge->TargetPinIndex * 0.01f;
+								++NeighborCount;
+							}
+						}
+					}
+				}
+				const float Score = NeighborCount > 0
+					? NeighborOrderSum / static_cast<float>(NeighborCount)
+					: static_cast<float>(Node->LayerOrder);
+				ScoreKeys.Add(Node, FMath::RoundToInt(Score * 1000.f));
+				PreviousOrder.Add(Node, Node->LayerOrder);
+			}
+
+			Layers[LayerIndex].Sort([&ScoreKeys, &PreviousOrder](const FBALNode& A, const FBALNode& B)
+			{
+				FBALNode* AP = const_cast<FBALNode*>(&A);
+				FBALNode* BP = const_cast<FBALNode*>(&B);
+				const int32 AScore = ScoreKeys.FindRef(AP);
+				const int32 BScore = ScoreKeys.FindRef(BP);
+				if (AScore != BScore) return AScore < BScore;
+				const int32 APrevious = PreviousOrder.FindRef(AP);
+				const int32 BPrevious = PreviousOrder.FindRef(BP);
+				if (APrevious != BPrevious) return APrevious < BPrevious;
+				return A.StableIndex < B.StableIndex;
+			});
+			for (int32 Index = 0; Index < Layers[LayerIndex].Num(); ++Index)
+			{
+				Layers[LayerIndex][Index]->LayerOrder = Index;
+			}
+		}
 	}
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────────────────────
+void FBALLayoutSolver::AlignLayers(
+	TArray<TArray<FBALNode*>>& Layers,
+	const TArray<FBALEdge>& Edges,
+	const TMap<UEdGraphNode*, float>& ClusterHeights,
+	const FBALSettings& Settings)
+{
+	TMap<UEdGraphNode*, FBALNode*> NodeMap;
+	for (TArray<FBALNode*>& Layer : Layers)
+	{
+		for (FBALNode* Node : Layer) NodeMap.Add(Node->GraphNode, Node);
+	}
 
-FBox2D FBALLayoutSolver::ComputeGraphBounds(const TMap<UEdGraphNode*, FBALNode>& Proxies)
+	TMap<UEdGraphNode*, TArray<const FBALEdge*>> IncomingEdges;
+	TMap<UEdGraphNode*, TArray<const FBALEdge*>> OutgoingEdges;
+	for (const FBALEdge& Edge : Edges)
+	{
+		if (Edge.bBackEdge || !NodeMap.Contains(Edge.Source) || !NodeMap.Contains(Edge.Target))
+		{
+			continue;
+		}
+		IncomingEdges.FindOrAdd(Edge.Target).Add(&Edge);
+		OutgoingEdges.FindOrAdd(Edge.Source).Add(&Edge);
+	}
+
+	for (int32 Pass = 0; Pass < FMath::Max(0, Settings.AlignmentPasses); ++Pass)
+	{
+		for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
+		{
+			TArray<float> DesiredTops;
+			DesiredTops.Reserve(Layers[LayerIndex].Num());
+			for (FBALNode* Node : Layers[LayerIndex])
+			{
+				TArray<float> Candidates;
+				if (const TArray<const FBALEdge*>* Incoming = IncomingEdges.Find(Node->GraphNode))
+				{
+					Candidates.Reserve(Incoming->Num());
+					for (const FBALEdge* Edge : *Incoming)
+					{
+						FBALNode* const Source = NodeMap.FindRef(Edge->Source);
+						if (Source->Layer != Node->Layer)
+						{
+							const float AlignedTop = Source->OutPos.Y
+								+ EstimatePinOffset(*Source, Edge->SourcePin)
+								- EstimatePinOffset(*Node, Edge->TargetPin);
+							Candidates.Add(AlignedTop);
+							if (Edge->bPrimary) Candidates.Add(AlignedTop);
+						}
+					}
+				}
+				if (const TArray<const FBALEdge*>* Outgoing = OutgoingEdges.Find(Node->GraphNode))
+				{
+					Candidates.Reserve(Candidates.Num() + Outgoing->Num());
+					for (const FBALEdge* Edge : *Outgoing)
+					{
+						FBALNode* const Target = NodeMap.FindRef(Edge->Target);
+						if (Target->Layer != Node->Layer)
+						{
+							const float AlignedTop = Target->OutPos.Y
+								+ EstimatePinOffset(*Target, Edge->TargetPin)
+								- EstimatePinOffset(*Node, Edge->SourcePin);
+							Candidates.Add(AlignedTop);
+							if (Edge->bPrimary) Candidates.Add(AlignedTop);
+						}
+					}
+				}
+				const float Height = ClusterHeights.FindRef(Node->GraphNode);
+				const float Offset = (Height - Node->Size.Y) * 0.5f;
+				DesiredTops.Add(Median(Candidates, Node->OutPos.Y) - Offset);
+			}
+
+			float Cursor = DesiredTops.Num() > 0 ? DesiredTops[0] : 0.f;
+			for (int32 Index = 0; Index < Layers[LayerIndex].Num(); ++Index)
+			{
+				FBALNode* Node = Layers[LayerIndex][Index];
+				const float Height = ClusterHeights.FindRef(Node->GraphNode);
+				const float Top = Index == 0 ? DesiredTops[Index] : FMath::Max(DesiredTops[Index], Cursor);
+				Node->OutPos.Y = Top + (Height - Node->Size.Y) * 0.5f;
+				Cursor = Top + Height + EffectiveGap(Settings.GapY, Settings.NodeMargin);
+			}
+		}
+	}
+}
+
+void FBALLayoutSolver::PlacePureGroups(
+	TMap<UEdGraphNode*, FBALNode>& Proxies,
+	const TArray<FBALEdge>& Edges,
+	TMap<UEdGraphNode*, TArray<FBALNode*>>& OwnedPuresByConsumer,
+	EBALPureDir PureDir,
+	const FBALSettings& Settings)
+{
+	TMap<UEdGraphNode*, int32> RelevantTargetPins;
+	for (const TPair<UEdGraphNode*, FBALNode>& Pair : Proxies)
+	{
+		if (Pair.Value.Role == EBALNodeRole::Pure && Pair.Value.PureOwner != nullptr)
+		{
+			RelevantTargetPins.Add(Pair.Key, MAX_int32);
+		}
+	}
+	for (const FBALEdge& Edge : Edges)
+	{
+		const FBALNode* Source = Proxies.Find(Edge.Source);
+		const FBALNode* Target = Proxies.Find(Edge.Target);
+		int32* TargetPin = RelevantTargetPins.Find(Edge.Source);
+		if (!Source || !TargetPin) continue;
+		if (Edge.Target == Source->PureOwner
+			|| (Target && Target->PureOwner == Source->PureOwner
+				&& Target->PureDepth < Source->PureDepth))
+		{
+			*TargetPin = FMath::Min(*TargetPin, Edge.TargetPinIndex);
+		}
+	}
+
+	for (TPair<UEdGraphNode*, FBALNode>& ConsumerPair : Proxies)
+	{
+		FBALNode& Consumer = ConsumerPair.Value;
+		if (Consumer.Role != EBALNodeRole::Exec)
+		{
+			continue;
+		}
+
+		TArray<FBALNode*>* GroupPtr = OwnedPuresByConsumer.Find(Consumer.GraphNode);
+		if (!GroupPtr || GroupPtr->Num() == 0)
+		{
+			continue;
+		}
+		TArray<FBALNode*>& Group = *GroupPtr;
+
+		Group.Sort([&RelevantTargetPins](const FBALNode& A, const FBALNode& B)
+		{
+			if (A.PureDepth != B.PureDepth) return A.PureDepth < B.PureDepth;
+			const int32 ATargetPin = RelevantTargetPins.FindChecked(A.GraphNode);
+			const int32 BTargetPin = RelevantTargetPins.FindChecked(B.GraphNode);
+			if (ATargetPin != BTargetPin) return ATargetPin < BTargetPin;
+			if (A.OriginalPos.Y != B.OriginalPos.Y) return A.OriginalPos.Y < B.OriginalPos.Y;
+			return A.StableIndex < B.StableIndex;
+		});
+		const int32 MaxDepth = Group.Last()->PureDepth;
+
+		TArray<float> Widths;
+		TArray<float> Heights;
+		TArray<float> RowWidths;
+		TArray<float> RowHeights;
+		Widths.SetNumZeroed(MaxDepth + 1);
+		Heights.SetNumZeroed(MaxDepth + 1);
+		RowWidths.SetNumZeroed(MaxDepth + 1);
+		RowHeights.SetNumZeroed(MaxDepth + 1);
+		TArray<int32> Counts;
+		Counts.SetNumZeroed(MaxDepth + 1);
+		for (FBALNode* Pure : Group)
+		{
+			Widths[Pure->PureDepth] = FMath::Max(Widths[Pure->PureDepth], Pure->Size.X);
+			Heights[Pure->PureDepth] += Pure->Size.Y;
+			RowWidths[Pure->PureDepth] += Pure->Size.X;
+			RowHeights[Pure->PureDepth] = FMath::Max(RowHeights[Pure->PureDepth], Pure->Size.Y);
+			++Counts[Pure->PureDepth];
+		}
+		for (int32 Depth = 0; Depth <= MaxDepth; ++Depth)
+		{
+			if (Counts[Depth] > 1)
+			{
+				Heights[Depth] += (Counts[Depth] - 1) * EffectiveGap(Settings.PureGapY, Settings.NodeMargin);
+				RowWidths[Depth] += (Counts[Depth] - 1) * EffectiveGap(Settings.PureGapX, Settings.NodeMargin);
+			}
+		}
+
+		const float HorizontalGap = EffectiveGap(Settings.GapX, Settings.NodeMargin);
+		const float LayerGap = EffectiveGap(Settings.PureGapX, Settings.NodeMargin);
+		const float ConsumerCenterY = Consumer.OutPos.Y + Consumer.Size.Y * 0.5f;
+		if (PureDir == EBALPureDir::West || PureDir == EBALPureDir::East)
+		{
+			float LayerX = PureDir == EBALPureDir::West
+				? Consumer.OutPos.X - HorizontalGap - Widths[0]
+				: Consumer.OutPos.X + Consumer.Size.X + HorizontalGap;
+			int32 GroupIndex = 0;
+			for (int32 Depth = 0; Depth <= MaxDepth; ++Depth)
+			{
+				float CursorY = ConsumerCenterY - Heights[Depth] * 0.5f;
+				while (GroupIndex < Group.Num() && Group[GroupIndex]->PureDepth == Depth)
+				{
+					FBALNode* Pure = Group[GroupIndex++];
+					const float X = PureDir == EBALPureDir::West
+						? LayerX + Widths[Depth] - Pure->Size.X
+						: LayerX;
+					Pure->OutPos = FVector2D(X, CursorY);
+					Pure->Layer = Consumer.Layer;
+					CursorY += Pure->Size.Y + EffectiveGap(Settings.PureGapY, Settings.NodeMargin);
+				}
+				if (Depth < MaxDepth)
+				{
+					LayerX += PureDir == EBALPureDir::West
+						? -(Widths[Depth + 1] + LayerGap)
+						: Widths[Depth] + LayerGap;
+				}
+			}
+		}
+		else
+		{
+			float LayerY = PureDir == EBALPureDir::North
+				? Consumer.OutPos.Y - EffectiveGap(Settings.GapY, Settings.NodeMargin) - RowHeights[0]
+				: Consumer.OutPos.Y + Consumer.Size.Y + EffectiveGap(Settings.GapY, Settings.NodeMargin);
+			int32 GroupIndex = 0;
+			for (int32 Depth = 0; Depth <= MaxDepth; ++Depth)
+			{
+				const float TotalWidth = RowWidths[Depth];
+				float CursorX = Consumer.OutPos.X + Consumer.Size.X * 0.5f - TotalWidth * 0.5f;
+				while (GroupIndex < Group.Num() && Group[GroupIndex]->PureDepth == Depth)
+				{
+					FBALNode* Pure = Group[GroupIndex++];
+					Pure->OutPos = FVector2D(CursorX, LayerY);
+					Pure->Layer = Consumer.Layer;
+					CursorX += Pure->Size.X + EffectiveGap(Settings.PureGapX, Settings.NodeMargin);
+				}
+				if (Depth < MaxDepth)
+				{
+					LayerY += PureDir == EBALPureDir::North
+						? -(RowHeights[Depth + 1] + EffectiveGap(Settings.GapY, Settings.NodeMargin))
+						: RowHeights[Depth] + EffectiveGap(Settings.GapY, Settings.NodeMargin);
+				}
+			}
+		}
+	}
+}
+
+void FBALLayoutSolver::PlaceKnotNodes(
+	TMap<UEdGraphNode*, FBALNode>& Proxies,
+	const FBALSettings& Settings)
+{
+	for (int32 Iteration = 0; Iteration < 8; ++Iteration)
+	{
+		TMap<UEdGraphNode*, FVector2D> NextPositions;
+		for (TPair<UEdGraphNode*, FBALNode>& Pair : Proxies)
+		{
+			FBALNode& Knot = Pair.Value;
+			if (Knot.Role != EBALNodeRole::Knot)
+			{
+				continue;
+			}
+			FVector2D Sum = FVector2D::ZeroVector;
+			int32 Count = 0;
+			for (UEdGraphPin* KnotPin : Knot.GraphNode->Pins)
+			{
+				if (!KnotPin) continue;
+				for (UEdGraphPin* Linked : KnotPin->LinkedTo)
+				{
+					FBALNode* Other = Proxies.Find(Linked ? Linked->GetOwningNode() : nullptr);
+					if (!Other || Other->Role == EBALNodeRole::Comment) continue;
+					FVector2D Anchor;
+					if (Other->Role == EBALNodeRole::Knot)
+					{
+						Anchor = Other->OutPos + Other->Size * 0.5f;
+					}
+					else
+					{
+						Anchor.X = Linked->Direction == EGPD_Input
+							? Other->OutPos.X
+							: Other->OutPos.X + Other->Size.X;
+						Anchor.Y = Other->OutPos.Y + EstimatePinOffset(*Other, Linked);
+					}
+					Sum += Anchor;
+					++Count;
+				}
+			}
+			if (Count > 0)
+			{
+				NextPositions.Add(Knot.GraphNode, Sum / static_cast<float>(Count) - Knot.Size * 0.5f);
+			}
+		}
+		for (TPair<UEdGraphNode*, FVector2D>& Pair : NextPositions)
+		{
+			Proxies.FindChecked(Pair.Key).OutPos = Pair.Value;
+		}
+	}
+	(void)Settings;
+}
+
+void FBALLayoutSolver::PreserveComponentAnchors(
+	TArray<FBALComponent>& Components,
+	TMap<UEdGraphNode*, FBALNode>& Proxies,
+	const FBALSettings& Settings)
+{
+	if (!Settings.bPreserveAnchors)
+	{
+		return;
+	}
+	for (FBALComponent& Component : Components)
+	{
+		FBALNode* Anchor = Proxies.Find(Component.Anchor);
+		if (!Anchor)
+		{
+			continue;
+		}
+		const FVector2D Delta = Component.OriginalAnchor - Anchor->OutPos;
+		for (UEdGraphNode* Node : Component.Nodes)
+		{
+			FBALNode* Proxy = Proxies.Find(Node);
+			if (Proxy) Proxy->OutPos += Delta;
+		}
+	}
+}
+
+void FBALLayoutSolver::PackOverlappingComponents(
+	TArray<FBALComponent>& Components,
+	TMap<UEdGraphNode*, FBALNode>& Proxies,
+	const FBALSettings& Settings)
+{
+	TArray<FBALComponent*> Ordered;
+	for (FBALComponent& Component : Components) Ordered.Add(&Component);
+	Ordered.Sort([](const FBALComponent& A, const FBALComponent& B)
+	{
+		if (A.bHasHardAnchor != B.bHasHardAnchor) return A.bHasHardAnchor;
+		if (A.OriginalAnchor.Y != B.OriginalAnchor.Y) return A.OriginalAnchor.Y < B.OriginalAnchor.Y;
+		if (A.OriginalAnchor.X != B.OriginalAnchor.X) return A.OriginalAnchor.X < B.OriginalAnchor.X;
+		return A.Id < B.Id;
+	});
+
+	TArray<FBox2D> PlacedBounds;
+	for (FBALComponent* Component : Ordered)
+	{
+		FBox2D Bounds = ComponentBounds(*Component, Proxies);
+		if (!Component->bHasHardAnchor)
+		{
+			for (int32 Attempt = 0; Attempt < Components.Num() * 2 + 1; ++Attempt)
+			{
+				float PushDown = 0.f;
+				float PushRight = 0.f;
+				bool bOverlap = false;
+				for (const FBox2D& Other : PlacedBounds)
+				{
+					const FBox2D Expanded(
+						Other.Min - FVector2D(Settings.ComponentGapX, Settings.ComponentGapY),
+						Other.Max + FVector2D(Settings.ComponentGapX, Settings.ComponentGapY));
+					const bool bStrictOverlap =
+						Bounds.Min.X < Expanded.Max.X && Expanded.Min.X < Bounds.Max.X
+						&& Bounds.Min.Y < Expanded.Max.Y && Expanded.Min.Y < Bounds.Max.Y;
+					if (!bStrictOverlap) continue;
+					bOverlap = true;
+					PushDown = FMath::Max(PushDown, Expanded.Max.Y - Bounds.Min.Y);
+					PushRight = FMath::Max(PushRight, Expanded.Max.X - Bounds.Min.X);
+				}
+				if (!bOverlap) break;
+				const FVector2D Delta = PushDown <= PushRight
+					? FVector2D(0.f, PushDown)
+					: FVector2D(PushRight, 0.f);
+				for (UEdGraphNode* Node : Component->Nodes)
+				{
+					FBALNode* Proxy = Proxies.Find(Node);
+					if (Proxy) Proxy->OutPos += Delta;
+				}
+				Bounds = ComponentBounds(*Component, Proxies);
+			}
+		}
+		PlacedBounds.Add(Bounds);
+	}
+}
+
+float FBALLayoutSolver::EstimatePinOffset(const FBALNode& Node, const UEdGraphPin* Pin)
+{
+	if (!Pin || !Node.GraphNode)
+	{
+		return Node.Size.Y * 0.5f;
+	}
+	int32 Count = 0;
+	int32 Index = 0;
+	for (const UEdGraphPin* Candidate : Node.GraphNode->Pins)
+	{
+		if (!Candidate || Candidate->Direction != Pin->Direction) continue;
+		if (Candidate == Pin) Index = Count;
+		++Count;
+	}
+	if (Count <= 0) return Node.Size.Y * 0.5f;
+	const float Header = FMath::Min(36.f, Node.Size.Y * 0.35f);
+	const float RowHeight = FMath::Max(18.f, (Node.Size.Y - Header) / static_cast<float>(Count));
+	return FMath::Clamp(Header + (Index + 0.5f) * RowHeight, 8.f, FMath::Max(8.f, Node.Size.Y - 8.f));
+}
+
+float FBALLayoutSolver::PureClusterHeight(
+	const FBALNode& Consumer,
+	const TArray<FBALNode*>& OwnedPures,
+	EBALPureDir PureDir,
+	const FBALSettings& Settings)
+{
+	TMap<int32, float> Heights;
+	TMap<int32, int32> Counts;
+	int32 MaxDepth = -1;
+	for (const FBALNode* Pure : OwnedPures)
+	{
+		if (PureDir == EBALPureDir::North || PureDir == EBALPureDir::South)
+		{
+			Heights.FindOrAdd(Pure->PureDepth) = FMath::Max(Heights.FindRef(Pure->PureDepth), Pure->Size.Y);
+		}
+		else
+		{
+			Heights.FindOrAdd(Pure->PureDepth) += Pure->Size.Y;
+		}
+		++Counts.FindOrAdd(Pure->PureDepth);
+		MaxDepth = FMath::Max(MaxDepth, Pure->PureDepth);
+	}
+	if (MaxDepth < 0) return Consumer.Size.Y;
+	if (PureDir == EBALPureDir::North || PureDir == EBALPureDir::South)
+	{
+		float Extension = EffectiveGap(Settings.GapY, Settings.NodeMargin);
+		for (int32 Depth = 0; Depth <= MaxDepth; ++Depth)
+		{
+			Extension += Heights.FindRef(Depth);
+			if (Depth < MaxDepth) Extension += EffectiveGap(Settings.GapY, Settings.NodeMargin);
+		}
+		return Consumer.Size.Y + Extension * 2.f;
+	}
+	float Result = Consumer.Size.Y;
+	for (const TPair<int32, float>& Pair : Heights)
+	{
+		Result = FMath::Max(Result, Pair.Value
+			+ FMath::Max(0, Counts.FindRef(Pair.Key) - 1) * EffectiveGap(Settings.PureGapY, Settings.NodeMargin));
+	}
+	return Result;
+}
+
+float FBALLayoutSolver::PureLeftExtension(
+	const TArray<FBALNode*>& OwnedPures,
+	const FBALSettings& Settings)
+{
+	TMap<int32, float> WidthByDepth;
+	int32 MaxDepth = -1;
+	for (const FBALNode* Pure : OwnedPures)
+	{
+		WidthByDepth.FindOrAdd(Pure->PureDepth) = FMath::Max(WidthByDepth.FindRef(Pure->PureDepth), Pure->Size.X);
+		MaxDepth = FMath::Max(MaxDepth, Pure->PureDepth);
+	}
+	if (MaxDepth < 0) return 0.f;
+	float Width = EffectiveGap(Settings.GapX, Settings.NodeMargin);
+	for (int32 Depth = 0; Depth <= MaxDepth; ++Depth)
+	{
+		Width += WidthByDepth.FindRef(Depth);
+		if (Depth < MaxDepth) Width += EffectiveGap(Settings.PureGapX, Settings.NodeMargin);
+	}
+	return Width;
+}
+
+void FBALLayoutSolver::ClampSoftConstraint(FBALNode& Node)
+{
+	if (!Node.bConstrained || Node.ConstraintType != EBALConstraintType::Soft || Node.MaxDrift < 0.f)
+	{
+		return;
+	}
+	const FVector2D Delta = Node.OutPos - Node.OriginalPos;
+	const float Distance = Delta.Size();
+	if (Distance > Node.MaxDrift && Distance > KINDA_SMALL_NUMBER)
+	{
+		Node.OutPos = Node.OriginalPos + Delta * (Node.MaxDrift / Distance);
+	}
+}
+
+FBox2D FBALLayoutSolver::ComponentBounds(
+	const FBALComponent& Component,
+	const TMap<UEdGraphNode*, FBALNode>& Proxies)
 {
 	FBox2D Bounds(EForceInit::ForceInit);
-	bool bFirst = true;
-
-	for (const auto& KV : Proxies)
+	bool bHasNode = false;
+	for (UEdGraphNode* Node : Component.Nodes)
 	{
-		const FBALNode& N = KV.Value;
-		if (N.Role == EBALNodeRole::Isolated || N.Role == EBALNodeRole::Comment) continue;
-
-		FBox2D NodeBox(N.OutPos, N.OutPos + N.Size);
-		if (bFirst)
-		{
-			Bounds = NodeBox;
-			bFirst = false;
-		}
-		else
-		{
-			Bounds = Bounds + NodeBox;
-		}
+		const FBALNode* Proxy = Proxies.Find(Node);
+		if (!Proxy || Proxy->Role == EBALNodeRole::Comment) continue;
+		const FBox2D NodeBounds(Proxy->OutPos, Proxy->OutPos + Proxy->Size);
+		Bounds = bHasNode ? Bounds + NodeBounds : NodeBounds;
+		bHasNode = true;
 	}
-
-	if (bFirst) Bounds = FBox2D(FVector2D::ZeroVector, FVector2D(800.f, 600.f));
-	return Bounds;
-}
-
-float FBALLayoutSolver::PureGroupHeight(const TArray<FBALNode*>& Group)
-{
-	float H = 0.f;
-	for (const FBALNode* P : Group) H += P->Size.Y;
-	return H;
-}
-
-float FBALLayoutSolver::PureGroupWidth(const TArray<FBALNode*>& Group)
-{
-	float W = 0.f;
-	for (const FBALNode* P : Group) W = FMath::Max(W, P->Size.X);
-	return W;
+	return bHasNode ? Bounds : FBox2D(FVector2D::ZeroVector, FVector2D::ZeroVector);
 }

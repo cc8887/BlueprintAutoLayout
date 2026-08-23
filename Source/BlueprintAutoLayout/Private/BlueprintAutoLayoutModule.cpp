@@ -42,7 +42,12 @@
 #include "Materials/MaterialFunction.h"
 
 #include "Misc/MessageDialog.h"
+#include "Runtime/Launch/Resources/Version.h"
+#if ENGINE_MAJOR_VERSION >= 5
 #include "Styling/AppStyle.h"
+#else
+#include "EditorStyleSet.h"
+#endif
 #include "UObject/UObjectIterator.h"
 #include "UObject/UObjectHash.h"
 
@@ -52,6 +57,15 @@
 
 namespace
 {
+	FName GetBALStyleSetName()
+	{
+#if ENGINE_MAJOR_VERSION >= 5
+		return FAppStyle::GetAppStyleSetName();
+#else
+		return FEditorStyle::GetStyleSetName();
+#endif
+	}
+
 #if BAL_ANY_DSL_INTEGRATION
 	const FName AutoLayoutBehaviorName(TEXT("AutoLayout"));
 	constexpr int32 AutoLayoutEarlyPriority = 100;
@@ -114,7 +128,7 @@ namespace
 		{
 			return;
 		}
-		if (ChangedNodes.IsEmpty())
+		if (ChangedNodes.Num() == 0)
 		{
 			FBlueprintAutoLayoutEngine::Layout(Context.TargetGraph);
 			return;
@@ -214,7 +228,7 @@ FBALCommands::FBALCommands()
 		TEXT("BlueprintAutoLayout"),
 		LOCTEXT("BlueprintAutoLayout", "Blueprint Auto Layout"),
 		NAME_None,
-		FAppStyle::GetAppStyleSetName())
+		GetBALStyleSetName())
 {}
 
 void FBALCommands::RegisterCommands()
@@ -410,13 +424,13 @@ void FBlueprintAutoLayoutModule::RegisterMenuExtensions()
 					ActionLayoutGraph,
 					LOCTEXT("LayoutGraph", "Auto Layout"),
 					LOCTEXT("LayoutGraphTip", "Auto-arrange all nodes in the current graph (Ctrl+Shift+L)"),
-					FSlateIcon(FAppStyle::GetAppStyleSetName(), "BlueprintEditor.AutoArrange")));
+					FSlateIcon(GetBALStyleSetName(), "BlueprintEditor.AutoArrange")));
 				Section.AddEntry(FToolMenuEntry::InitToolBarButton(
 					"BAL_LayoutSelection",
 					ActionLayoutSelection,
 					LOCTEXT("LayoutSel", "Layout Selection"),
 					LOCTEXT("LayoutSelTip", "Auto-arrange only the selected nodes"),
-					FSlateIcon(FAppStyle::GetAppStyleSetName(), "BlueprintEditor.AutoArrange")));
+					FSlateIcon(GetBALStyleSetName(), "BlueprintEditor.AutoArrange")));
 			}
 		}
 	}
@@ -428,12 +442,12 @@ void FBlueprintAutoLayoutModule::RegisterMenuExtensions()
 		Section.AddMenuEntry("BAL_LayoutGraph2",
 			LOCTEXT("LayoutGraph2", "Auto Layout Graph"),
 			LOCTEXT("LayoutGraphTip2", "Auto-arrange all nodes"),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "BlueprintEditor.AutoArrange"),
+			FSlateIcon(GetBALStyleSetName(), "BlueprintEditor.AutoArrange"),
 			ActionLayoutGraph);
 		Section.AddMenuEntry("BAL_LayoutSelection2",
 			LOCTEXT("LayoutSel2", "Auto Layout Selection"),
 			LOCTEXT("LayoutSelTip2", "Auto-arrange selected nodes only"),
-			FSlateIcon(FAppStyle::GetAppStyleSetName(), "BlueprintEditor.AutoArrange"),
+			FSlateIcon(GetBALStyleSetName(), "BlueprintEditor.AutoArrange"),
 			ActionLayoutSelection);
 	}
 }
@@ -468,7 +482,7 @@ void FBlueprintAutoLayoutModule::OnLayoutSelection()
 	}
 
 	TSet<UEdGraphNode*> Selection = GetSelectedNodes(Graph);
-	if (Selection.IsEmpty())
+	if (Selection.Num() == 0)
 	{
 		FBlueprintAutoLayoutEngine::Layout(Graph);
 		return;
@@ -519,7 +533,11 @@ UEdGraph* FBlueprintAutoLayoutModule::GetActiveGraph() const
 		if (EditorInstance->GetEditorName() == FName("MaterialEditor"))
 		{
 			TArray<UObject*> SubObjects;
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
 			GetObjectsWithOuter(Asset, SubObjects, EGetObjectsFlags::None);
+#else
+			GetObjectsWithOuter(Asset, SubObjects, false);
+#endif
 			for (UObject* Sub : SubObjects)
 			{
 				if (UMaterialGraph* MatGraph = Cast<UMaterialGraph>(Sub))

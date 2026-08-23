@@ -22,17 +22,24 @@ void FBALConstraintCollector::Collect(UEdGraph* Graph,
 	{
 		if (!Node) continue;
 
-		// Already handled as a RigidGroup member or Comment box itself
-		if (GroupMap.Contains(Node)) continue;
-
 		if (IsPinned(Node))
 		{
+			// Explicit pinning always overrides comment membership.
+			OutConstraints.RemoveAll([Node](const FBALConstraint& Existing)
+			{
+				return Existing.Node == Node;
+			});
 			FBALConstraint C;
 			C.Node        = Node;
 			C.Type        = EBALConstraintType::Hard;
 			C.MaxDrift    = 0.f;
 			C.OriginalPos = FVector2D((float)Node->NodePosX, (float)Node->NodePosY);
 			OutConstraints.Add(C);
+		}
+		// Already represented as a movable comment group member.
+		else if (GroupMap.Contains(Node))
+		{
+			continue;
 		}
 		// Knot nodes: soft constraint — let them drift a bit to resolve wire crossings
 		else if (Node->GetClass()->GetName().Contains(TEXT("Knot")) ||
@@ -58,10 +65,10 @@ void FBALConstraintCollector::CollectForSelection(UEdGraph* Graph,
 	TArray<FBALConstraint> StandardConstraints;
 	Collect(Graph, StandardConstraints);
 
-	// Keep only constraints whose node is inside the selection (or is a Comment)
+	// Keep standard constraints only for nodes inside the selection.
 	for (FBALConstraint& C : StandardConstraints)
 	{
-		if (Selection.Contains(C.Node) || Cast<UEdGraphNode_Comment>(C.Node))
+		if (Selection.Contains(C.Node))
 		{
 			OutConstraints.Add(C);
 		}
@@ -73,10 +80,10 @@ void FBALConstraintCollector::CollectForSelection(UEdGraph* Graph,
 		if (!Node) continue;
 		if (Selection.Contains(Node)) continue;
 
-		// Don't double-add
-		bool bAlreadyAdded = OutConstraints.ContainsByPredicate(
-			[Node](const FBALConstraint& C){ return C.Node == Node; });
-		if (bAlreadyAdded) continue;
+		OutConstraints.RemoveAll([Node](const FBALConstraint& Existing)
+		{
+			return Existing.Node == Node;
+		});
 
 		FBALConstraint C;
 		C.Node        = Node;
@@ -125,61 +132,69 @@ void FBALConstraintCollector::CollectCommentGroups(UEdGraph* Graph,
                                                    TArray<FBALConstraint>& OutConstraints,
                                                    TMap<UEdGraphNode*, int32>& OutGroupMap)
 {
-	int32 GroupId = 0;
+	TArray<UEdGraphNode_Comment*> Comments;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (UEdGraphNode_Comment* Comment = Cast<UEdGraphNode_Comment>(Node))
+		{
+			Comments.Add(Comment);
+		}
+	}
+
+	TMap<UEdGraphNode_Comment*, int32> CommentIds;
+	TMap<UEdGraphNode_Comment*, TArray<UEdGraphNode*>> DirectMembers;
+	for (int32 Index = 0; Index < Comments.Num(); ++Index)
+	{
+		CommentIds.Add(Comments[Index], Index);
+	}
 
 	for (UEdGraphNode* Node : Graph->Nodes)
 	{
-		UEdGraphNode_Comment* Comment = Cast<UEdGraphNode_Comment>(Node);
-		if (!Comment) continue;
-
-		// Find all nodes inside this comment box
-		// Comment boxes in UE store their contained nodes via the NodeComment rect
-		const int32 CX = Comment->NodePosX;
-		const int32 CY = Comment->NodePosY;
-		const int32 CW = Comment->NodeWidth;
-		const int32 CH = Comment->NodeHeight;
-
-		TArray<UEdGraphNode*> MembersInBox;
-
-		for (UEdGraphNode* Other : Graph->Nodes)
+		if (!Node || Cast<UEdGraphNode_Comment>(Node)) continue;
+		UEdGraphNode_Comment* BestComment = nullptr;
+		float BestArea = MAX_flt;
+		const float CenterX = Node->NodePosX + FMath::Max(0, Node->NodeWidth) * 0.5f;
+		const float CenterY = Node->NodePosY + FMath::Max(0, Node->NodeHeight) * 0.5f;
+		for (UEdGraphNode_Comment* Comment : Comments)
 		{
-			if (Other == Comment) continue;
-			// Check if Other's centre is inside the comment rect
-			const float OX = (float)Other->NodePosX;
-			const float OY = (float)Other->NodePosY;
-			if (OX >= CX && OX <= (CX + CW) && OY >= CY && OY <= (CY + CH))
+			const float Area = static_cast<float>(Comment->NodeWidth) * Comment->NodeHeight;
+			const bool bInside = CenterX >= Comment->NodePosX
+				&& CenterX <= Comment->NodePosX + Comment->NodeWidth
+				&& CenterY >= Comment->NodePosY
+				&& CenterY <= Comment->NodePosY + Comment->NodeHeight;
+			if (bInside && Area < BestArea)
 			{
-				MembersInBox.Add(Other);
+				BestArea = Area;
+				BestComment = Comment;
 			}
 		}
+		if (BestComment) DirectMembers.FindOrAdd(BestComment).Add(Node);
+	}
 
-		if (MembersInBox.Num() == 0) continue;
+	for (UEdGraphNode_Comment* Comment : Comments)
+	{
+		const TArray<UEdGraphNode*>* Members = DirectMembers.Find(Comment);
+		if (!Members || Members->Num() == 0) continue;
+		const int32 GroupId = CommentIds.FindChecked(Comment);
+		FBALConstraint CommentConstraint;
+		CommentConstraint.Node = Comment;
+		CommentConstraint.Type = EBALConstraintType::RigidGroup;
+		CommentConstraint.OriginalPos = FVector2D(Comment->NodePosX, Comment->NodePosY);
+		CommentConstraint.GroupId = GroupId;
+		CommentConstraint.bCommentGroup = true;
+		OutConstraints.Add(CommentConstraint);
+		OutGroupMap.Add(Comment, GroupId);
 
-		// Comment box itself: Hard (it will be moved as a rigid unit)
+		for (UEdGraphNode* Member : *Members)
 		{
-			FBALConstraint C;
-			C.Node        = Comment;
-			C.Type        = EBALConstraintType::RigidGroup;
-			C.MaxDrift    = 0.f;
-			C.OriginalPos = FVector2D((float)CX, (float)CY);
-			C.GroupId     = GroupId;
-			OutConstraints.Add(C);
-			OutGroupMap.Add(Comment, GroupId);
-		}
-
-		// Members: RigidGroup
-		for (UEdGraphNode* Member : MembersInBox)
-		{
-			FBALConstraint C;
-			C.Node        = Member;
-			C.Type        = EBALConstraintType::RigidGroup;
-			C.MaxDrift    = 0.f;
-			C.OriginalPos = FVector2D((float)Member->NodePosX, (float)Member->NodePosY);
-			C.GroupId     = GroupId;
-			OutConstraints.Add(C);
+			FBALConstraint MemberConstraint;
+			MemberConstraint.Node = Member;
+			MemberConstraint.Type = EBALConstraintType::RigidGroup;
+			MemberConstraint.OriginalPos = FVector2D(Member->NodePosX, Member->NodePosY);
+			MemberConstraint.GroupId = GroupId;
+			MemberConstraint.bCommentGroup = true;
+			OutConstraints.Add(MemberConstraint);
 			OutGroupMap.Add(Member, GroupId);
 		}
-
-		++GroupId;
 	}
 }

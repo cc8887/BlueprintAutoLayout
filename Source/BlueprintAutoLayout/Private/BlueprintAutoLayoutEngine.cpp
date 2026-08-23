@@ -53,7 +53,7 @@ void FBlueprintAutoLayoutEngine::RunPipeline(UEdGraph* Graph,
 	FBALGraphAnalyzer::FAnalysisResult Analysis =
 	    FBALGraphAnalyzer::Analyze(Graph, Settings, Constraints);
 
-	if (Analysis.Proxies.IsEmpty()) return;
+	if (Analysis.Proxies.Num() == 0) return;
 
 	// ── Stage 2: Vote for Pure direction ──────────────────────
 	FBALStyleVoter::FVoteContext VoteCtx;
@@ -67,6 +67,8 @@ void FBlueprintAutoLayoutEngine::RunPipeline(UEdGraph* Graph,
 	FBALLayoutSolver::FSolverInput SolverIn;
 	SolverIn.Proxies        = &Analysis.Proxies;
 	SolverIn.ExecRoots      = &Analysis.ExecRoots;
+	SolverIn.Edges          = &Analysis.Edges;
+	SolverIn.Components     = &Analysis.Components;
 	SolverIn.IsolatedPures  = &Analysis.IsolatedPures;
 	SolverIn.IsolatedNodes  = &Analysis.IsolatedNodes;
 	SolverIn.Constraints    = &Constraints;
@@ -84,7 +86,8 @@ void FBlueprintAutoLayoutEngine::RunPipeline(UEdGraph* Graph,
 	FBALCollisionResolver::Resolve(ResolveIn);
 
 	// ── Stage 5: Commit ───────────────────────────────────────
-	int32 Written = FBALCommitter::Commit(Graph, Analysis.Proxies, Constraints, Settings);
+	int32 Written = FBALCommitter::Commit(
+		Graph, Analysis.Proxies, Constraints, Settings, &Analysis.CommentGroups);
 
 	UE_LOG(LogTemp, Log, TEXT("BlueprintAutoLayout: Arranged %d nodes in '%s'"),
 	       Written, *Graph->GetName());
