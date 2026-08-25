@@ -3,6 +3,11 @@
 
 using System.Collections.Generic;
 using UnrealBuildTool;
+#if UE_5_0_OR_LATER
+using EpicGames.Core;
+#else
+using Tools.DotNETCommon;
+#endif
 
 public class BlueprintAutoLayout : ModuleRules
 {
@@ -22,7 +27,7 @@ public class BlueprintAutoLayout : ModuleRules
 		// interface. They are optional: when a plugin is not enabled for this
 		// target we drop the dependency and compile out the corresponding
 		// hook via the WITH_<PLUGIN> macros below.
-		HashSet<string> EnabledPlugins = GetEnabledProjectPluginNames(Target);
+		HashSet<string> EnabledPlugins = GetEnabledOptionalPluginNames(Target);
 		AddOptionalPluginModule(EnabledPlugins, "BlueprintLisp", "WITH_BLUEPRINTLISP");
 		AddOptionalPluginModule(EnabledPlugins, "AnimBP2FP",     "WITH_ANIMBP2FP");
 		AddOptionalPluginModule(EnabledPlugins, "MatBP2FP",      "WITH_MATBP2FP");
@@ -78,16 +83,15 @@ public class BlueprintAutoLayout : ModuleRules
 	}
 
 	/// <summary>
-	/// Returns the set of project plugin names that are actually enabled for
-	/// this target, using UBT's own plugin discovery and enablement logic.
+	/// Returns optional integration plugins available to this target. Project
+	/// plugins must be enabled; compatible engine plugins are available through
+	/// this plugin's enabled optional references.
 	///
-	/// This is authoritative: it honours the .uproject "Enabled" flag,
-	/// per-platform / per-target / per-configuration filtering, and — unlike a
-	/// naive recursive file search — it ignores stray *.uplugin copies that
-	/// live under packaged-output or intermediate folders (UBT stops
-	/// descending a directory subtree once it finds a .uplugin there).
+	/// UBT discovery avoids stray *.uplugin copies under packaged-output or
+	/// intermediate folders, and also covers dependencies temporarily installed
+	/// under Engine/Plugins by BuildPlugin-based CI.
 	/// </summary>
-	private static HashSet<string> GetEnabledProjectPluginNames(ReadOnlyTargetRules Target)
+	private HashSet<string> GetEnabledOptionalPluginNames(ReadOnlyTargetRules Target)
 	{
 		HashSet<string> Result = new HashSet<string>(System.StringComparer.OrdinalIgnoreCase);
 
@@ -106,6 +110,18 @@ public class BlueprintAutoLayout : ModuleRules
 		{
 			if (Plugins.IsPluginEnabledForTarget(
 				Plugin, Project, Target.Platform, Target.Configuration, Target.Type))
+			{
+				Result.Add(Plugin.Name);
+			}
+		}
+
+		// BuildPlugin dependencies are exposed under Engine/Plugins while the
+		// foreign plugin is compiled in UAT's generated host project. They are
+		// enabled by this plugin's optional references, but are not returned by
+		// ReadProjectPlugins, so include compatible engine plugins as well.
+		foreach (PluginInfo Plugin in Plugins.ReadEnginePlugins(new DirectoryReference(EngineDirectory)))
+		{
+			if (Plugin.Descriptor.SupportsTargetPlatform(Target.Platform))
 			{
 				Result.Add(Plugin.Name);
 			}

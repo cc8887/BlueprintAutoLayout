@@ -758,6 +758,7 @@ void FBALLayoutSolver::LayoutDataComponent(
 		if (Edge.Kind == EBALEdgeKind::Data && ContainsNode(NodeSet, Edge))
 		{
 			Outgoing.FindChecked(Edge.Source).Add(EdgeIndex);
+			Edge.bPrimary = false;
 		}
 	}
 	for (TPair<UEdGraphNode*, TArray<int32>>& Pair : Outgoing)
@@ -774,7 +775,6 @@ void FBALLayoutSolver::LayoutDataComponent(
 			return AIndex < BIndex;
 		});
 	}
-
 	Nodes.Sort([](const FBALNode& A, const FBALNode& B) { return A.StableIndex < B.StableIndex; });
 	for (FBALNode* Node : Nodes)
 	{
@@ -798,6 +798,8 @@ void FBALLayoutSolver::LayoutDataComponent(
 	}
 
 	TArray<UEdGraphNode*> Ready;
+	TArray<UEdGraphNode*> TopologicalOrder;
+	TopologicalOrder.Reserve(Nodes.Num());
 	for (FBALNode* Node : Nodes)
 	{
 		if (InDegree.FindRef(Node->GraphNode) == 0)
@@ -814,6 +816,7 @@ void FBALLayoutSolver::LayoutDataComponent(
 		});
 		UEdGraphNode* Node = Ready[0];
 		Ready.RemoveAt(0);
+		TopologicalOrder.Add(Node);
 		for (int32 EdgeIndex : Outgoing.FindChecked(Node))
 		{
 			const FBALEdge& Edge = Edges[EdgeIndex];
@@ -826,20 +829,36 @@ void FBALLayoutSolver::LayoutDataComponent(
 		}
 	}
 
+	// Blueprint Assist formats Material/data graphs from their result node back
+	// through inputs. Reverse longest-path ranks keep direct sink inputs close to
+	// the sink while preserving left-to-right direction for every data edge.
+	TMap<UEdGraphNode*, int32> DistanceToSink;
+	int32 MaxDistanceToSink = 0;
+	for (int32 OrderIndex = TopologicalOrder.Num() - 1; OrderIndex >= 0; --OrderIndex)
+	{
+		UEdGraphNode* Node = TopologicalOrder[OrderIndex];
+		int32 Distance = 0;
+		for (int32 EdgeIndex : Outgoing.FindChecked(Node))
+		{
+			const FBALEdge& Edge = Edges[EdgeIndex];
+			if (!Edge.bBackEdge)
+			{
+				Distance = FMath::Max(Distance, DistanceToSink.FindRef(Edge.Target) + 1);
+			}
+		}
+		DistanceToSink.Add(Node, Distance);
+		MaxDistanceToSink = FMath::Max(MaxDistanceToSink, Distance);
+	}
+	for (FBALNode* Node : Nodes)
+	{
+		Node->Layer = MaxDistanceToSink - DistanceToSink.FindRef(Node->GraphNode);
+	}
+
 	int32 MaxLayer = 0;
 	for (FBALNode* Node : Nodes) MaxLayer = FMath::Max(MaxLayer, Node->Layer);
 	TArray<TArray<FBALNode*>> Layers;
 	Layers.SetNum(MaxLayer + 1);
 	for (FBALNode* Node : Nodes) Layers[Node->Layer].Add(Node);
-	for (TArray<FBALNode*>& Layer : Layers)
-	{
-		Layer.Sort([](const FBALNode& A, const FBALNode& B)
-		{
-			if (A.OriginalPos.Y != B.OriginalPos.Y) return A.OriginalPos.Y < B.OriginalPos.Y;
-			return A.StableIndex < B.StableIndex;
-		});
-	}
-	ReduceCrossings(Layers, Edges, Settings);
 
 	TArray<float> Widths;
 	TArray<float> X;
@@ -854,20 +873,166 @@ void FBALLayoutSolver::LayoutDataComponent(
 				+ EffectiveGap(Settings.GapX, Settings.NodeMargin);
 		}
 	}
-	TMap<UEdGraphNode*, float> Heights;
+
+	// Choose one downstream owner for each producer. The owner forest is only a
+	// placement structure: shared DAG links remain in Edges, but a shared node is
+	// assigned to exactly one branch envelope.
+	TMap<UEdGraphNode*, int32> OwnerEdgeBySource;
+	for (FBALNode* Node : Nodes)
+	{
+		int32 BestEdgeIndex = INDEX_NONE;
+		for (int32 EdgeIndex : Outgoing.FindChecked(Node->GraphNode))
+		{
+			const FBALEdge& Candidate = Edges[EdgeIndex];
+			if (Candidate.bBackEdge) continue;
+			if (BestEdgeIndex == INDEX_NONE)
+			{
+				BestEdgeIndex = EdgeIndex;
+				continue;
+			}
+
+			const FBALEdge& Existing = Edges[BestEdgeIndex];
+			const FBALNode& CandidateTarget = Proxies.FindChecked(Candidate.Target);
+			const FBALNode& ExistingTarget = Proxies.FindChecked(Existing.Target);
+			const bool bSameTarget = Candidate.Target == Existing.Target;
+			const bool bTake = CandidateTarget.Layer < ExistingTarget.Layer
+				|| (CandidateTarget.Layer == ExistingTarget.Layer && bSameTarget
+					&& Candidate.TargetPinIndex < Existing.TargetPinIndex)
+				|| (CandidateTarget.Layer == ExistingTarget.Layer && bSameTarget
+					&& Candidate.TargetPinIndex == Existing.TargetPinIndex
+					&& Candidate.SourcePinIndex < Existing.SourcePinIndex)
+				|| (CandidateTarget.Layer == ExistingTarget.Layer && !bSameTarget
+					&& CandidateTarget.StableIndex < ExistingTarget.StableIndex);
+			if (bTake) BestEdgeIndex = EdgeIndex;
+		}
+		if (BestEdgeIndex != INDEX_NONE) OwnerEdgeBySource.Add(Node->GraphNode, BestEdgeIndex);
+	}
+
+	TMap<UEdGraphNode*, TArray<int32>> OwnedChildren;
+	for (FBALNode* Node : Nodes) OwnedChildren.Add(Node->GraphNode, TArray<int32>());
+	for (const TPair<UEdGraphNode*, int32>& Pair : OwnerEdgeBySource)
+	{
+		const FBALEdge& Edge = Edges[Pair.Value];
+		OwnedChildren.FindChecked(Edge.Target).Add(Pair.Value);
+	}
+	for (TPair<UEdGraphNode*, TArray<int32>>& Pair : OwnedChildren)
+	{
+		Pair.Value.Sort([&Edges, &Proxies](int32 AIndex, int32 BIndex)
+		{
+			const FBALEdge& A = Edges[AIndex];
+			const FBALEdge& B = Edges[BIndex];
+			if (A.TargetPinIndex != B.TargetPinIndex) return A.TargetPinIndex < B.TargetPinIndex;
+			if (A.SourcePinIndex != B.SourcePinIndex) return A.SourcePinIndex < B.SourcePinIndex;
+			const FBALNode& ASource = Proxies.FindChecked(A.Source);
+			const FBALNode& BSource = Proxies.FindChecked(B.Source);
+			if (!FMath::IsNearlyEqual(ASource.OriginalPos.Y, BSource.OriginalPos.Y))
+			{
+				return ASource.OriginalPos.Y < BSource.OriginalPos.Y;
+			}
+			return ASource.StableIndex < BSource.StableIndex;
+		});
+		if (Pair.Value.Num() > 0) Edges[Pair.Value[0]].bPrimary = true;
+	}
+
+	// Build branch envelopes bottom-up. Only the first input continues the same
+	// row; every later input is shifted as one subtree below the preceding branch.
+	TMap<UEdGraphNode*, float> SubtreeMinY;
+	TMap<UEdGraphNode*, float> SubtreeMaxY;
+	TMap<UEdGraphNode*, float> OffsetFromOwner;
+	const float BranchGap = EffectiveGap(Settings.GapY, Settings.NodeMargin);
+	for (UEdGraphNode* GraphNode : TopologicalOrder)
+	{
+		const FBALNode& Node = Proxies.FindChecked(GraphNode);
+		float MinY = 0.f;
+		float MaxY = Node.Size.Y;
+		float BranchBottom = 0.f;
+		bool bHasPlacedBranch = false;
+		for (int32 EdgeIndex : OwnedChildren.FindChecked(GraphNode))
+		{
+			const FBALEdge& Edge = Edges[EdgeIndex];
+			const FBALNode& Child = Proxies.FindChecked(Edge.Source);
+			const float ChildMin = SubtreeMinY.FindRef(Edge.Source);
+			const float ChildMax = SubtreeMaxY.FindRef(Edge.Source);
+			float Offset = EstimatePinOffset(Node, Edge.TargetPin)
+				- EstimatePinOffset(Child, Edge.SourcePin);
+			if (bHasPlacedBranch)
+			{
+				Offset = FMath::Max(Offset, BranchBottom + BranchGap - ChildMin);
+			}
+			OffsetFromOwner.Add(Edge.Source, Offset);
+			MinY = FMath::Min(MinY, Offset + ChildMin);
+			MaxY = FMath::Max(MaxY, Offset + ChildMax);
+			BranchBottom = bHasPlacedBranch
+				? FMath::Max(BranchBottom, Offset + ChildMax)
+				: Offset + ChildMax;
+			bHasPlacedBranch = true;
+		}
+		SubtreeMinY.Add(GraphNode, MinY);
+		SubtreeMaxY.Add(GraphNode, MaxY);
+	}
+
+	TArray<UEdGraphNode*> Roots;
+	for (FBALNode* Node : Nodes)
+	{
+		if (!OwnerEdgeBySource.Contains(Node->GraphNode)) Roots.Add(Node->GraphNode);
+	}
+	Roots.Sort([&Proxies, &Component](const UEdGraphNode& A, const UEdGraphNode& B)
+	{
+		const bool bAAnchor = &A == Component.Anchor;
+		const bool bBAnchor = &B == Component.Anchor;
+		if (bAAnchor != bBAnchor) return bAAnchor;
+		const FBALNode& AProxy = Proxies.FindChecked(const_cast<UEdGraphNode*>(&A));
+		const FBALNode& BProxy = Proxies.FindChecked(const_cast<UEdGraphNode*>(&B));
+		if (!FMath::IsNearlyEqual(AProxy.OriginalPos.Y, BProxy.OriginalPos.Y))
+		{
+			return AProxy.OriginalPos.Y < BProxy.OriginalPos.Y;
+		}
+		return AProxy.StableIndex < BProxy.StableIndex;
+	});
+
+	float ForestBottom = 0.f;
+	bool bFirstRoot = true;
+	for (UEdGraphNode* Root : Roots)
+	{
+		const float RootY = bFirstRoot
+			? 0.f
+			: ForestBottom + BranchGap - SubtreeMinY.FindRef(Root);
+		FBALNode& RootProxy = Proxies.FindChecked(Root);
+		RootProxy.OutPos = FVector2D(X[RootProxy.Layer], RootY);
+
+		TArray<UEdGraphNode*> Pending;
+		Pending.Add(Root);
+		for (int32 Head = 0; Head < Pending.Num(); ++Head)
+		{
+			UEdGraphNode* ParentNode = Pending[Head];
+			const FBALNode& Parent = Proxies.FindChecked(ParentNode);
+			for (int32 EdgeIndex : OwnedChildren.FindChecked(ParentNode))
+			{
+				const FBALEdge& Edge = Edges[EdgeIndex];
+				FBALNode& Child = Proxies.FindChecked(Edge.Source);
+				Child.OutPos = FVector2D(
+					X[Child.Layer],
+					Parent.OutPos.Y + OffsetFromOwner.FindRef(Edge.Source));
+				Pending.Add(Edge.Source);
+			}
+		}
+
+		ForestBottom = FMath::Max(ForestBottom, RootY + SubtreeMaxY.FindRef(Root));
+		bFirstRoot = false;
+	}
+
 	for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
 	{
-		float CursorY = 0.f;
+		Layers[LayerIndex].Sort([](const FBALNode& A, const FBALNode& B)
+		{
+			if (!FMath::IsNearlyEqual(A.OutPos.Y, B.OutPos.Y)) return A.OutPos.Y < B.OutPos.Y;
+			return A.StableIndex < B.StableIndex;
+		});
 		for (int32 Order = 0; Order < Layers[LayerIndex].Num(); ++Order)
 		{
-			FBALNode* Node = Layers[LayerIndex][Order];
-			Node->LayerOrder = Order;
-			Node->OutPos = FVector2D(X[LayerIndex], CursorY);
-			Heights.Add(Node->GraphNode, Node->Size.Y);
-			CursorY += Node->Size.Y + EffectiveGap(Settings.GapY, Settings.NodeMargin);
+			Layers[LayerIndex][Order]->LayerOrder = Order;
 		}
 	}
-	AlignLayers(Layers, Edges, Heights, Settings);
 }
 
 void FBALLayoutSolver::ReduceCrossings(

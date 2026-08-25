@@ -817,12 +817,14 @@ void FBALGraphAnalyzer::BuildComponents(
 	TArray<FBALComponent>& OutComponents)
 {
 	TMap<UEdGraphNode*, int32> LogicalInDegree;
+	TMap<UEdGraphNode*, int32> LogicalOutDegree;
 	TMap<UEdGraphNode*, int32> ExecInDegree;
 	for (const FBALEdge& Edge : Edges)
 	{
 		if (!Edge.bBackEdge)
 		{
 			++LogicalInDegree.FindOrAdd(Edge.Target);
+			++LogicalOutDegree.FindOrAdd(Edge.Source);
 			if (Edge.Kind == EBALEdgeKind::Exec)
 			{
 				++ExecInDegree.FindOrAdd(Edge.Target);
@@ -893,15 +895,24 @@ void FBALGraphAnalyzer::BuildComponents(
 		for (UEdGraphNode* Candidate : Component.Nodes)
 		{
 			const FBALNode& Proxy = Proxies.FindChecked(Candidate);
-			int32 CandidateClass = 4;
+			const FString ClassName = Candidate->GetClass()->GetName();
+			const bool bExplicitGraphRoot = ClassName.Contains(TEXT("GraphNode_Root"));
+			const bool bDataSink = Proxy.Role == EBALNodeRole::Pure
+				&& LogicalOutDegree.FindRef(Candidate) == 0;
+			int32 CandidateClass = 6;
 			if (Proxy.bLocked) CandidateClass = 0;
 			else if (Proxy.Role == EBALNodeRole::Exec && ExecInDegree.FindRef(Candidate) == 0) CandidateClass = 1;
-			else if (LogicalInDegree.FindRef(Candidate) == 0) CandidateClass = 2;
-			else if (Proxy.Role == EBALNodeRole::Exec) CandidateClass = 3;
+			else if (bExplicitGraphRoot && bDataSink) CandidateClass = 2;
+			else if (bDataSink) CandidateClass = 3;
+			else if (LogicalInDegree.FindRef(Candidate) == 0) CandidateClass = 4;
+			else if (Proxy.Role == EBALNodeRole::Exec) CandidateClass = 5;
+			const float CandidateX = (CandidateClass == 2 || CandidateClass == 3)
+				? -Proxy.OriginalPos.X
+				: Proxy.OriginalPos.X;
 			const bool bBetter = CandidateClass < BestClass
-				|| (CandidateClass == BestClass && Proxy.OriginalPos.X < BestX)
-				|| (CandidateClass == BestClass && FMath::IsNearlyEqual(Proxy.OriginalPos.X, BestX) && Proxy.OriginalPos.Y < BestY)
-				|| (CandidateClass == BestClass && FMath::IsNearlyEqual(Proxy.OriginalPos.X, BestX)
+				|| (CandidateClass == BestClass && CandidateX < BestX)
+				|| (CandidateClass == BestClass && FMath::IsNearlyEqual(CandidateX, BestX) && Proxy.OriginalPos.Y < BestY)
+				|| (CandidateClass == BestClass && FMath::IsNearlyEqual(CandidateX, BestX)
 					&& FMath::IsNearlyEqual(Proxy.OriginalPos.Y, BestY) && Proxy.StableIndex < BestStable);
 			if (bBetter)
 			{
@@ -909,7 +920,7 @@ void FBALGraphAnalyzer::BuildComponents(
 				Component.OriginalAnchor = Proxy.OriginalPos;
 				Component.bHasHardAnchor = Proxy.bLocked;
 				BestClass = CandidateClass;
-				BestX = Proxy.OriginalPos.X;
+				BestX = CandidateX;
 				BestY = Proxy.OriginalPos.Y;
 				BestStable = Proxy.StableIndex;
 			}

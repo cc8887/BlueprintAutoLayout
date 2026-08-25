@@ -7,6 +7,7 @@
 #include "BALTestHelpers.h"
 #include "BALGraphAnalyzer.h"
 #include "BALLayoutSolver.h"
+#include "BlueprintAutoLayoutEngine.h"
 #include "Misc/AutomationTest.h"
 
 namespace
@@ -87,8 +88,185 @@ bool FBALTest_Advanced_PureDataChainLayering::RunTest(const FString& /*Params*/)
 		SourceProxy.OutPos.X + SourceProxy.Size.X < TransformProxy.OutPos.X);
 	TestTrue(TEXT("Transform is placed before sink"),
 		TransformProxy.OutPos.X + TransformProxy.Size.X < SinkProxy.OutPos.X);
-	TestTrue(TEXT("Component anchor remains at its original position"),
-		SourceProxy.OutPos.Equals(SourceProxy.OriginalPos, 0.01f));
+	TestTrue(TEXT("Data sink remains the component anchor"),
+		SinkProxy.OutPos.Equals(SinkProxy.OriginalPos, 0.01f));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FBALTest_Advanced_PureDataBranchesUseSeparateLanes,
+	"BlueprintAutoLayout.AdvancedRegression.Topology.PureDataBranchesUseSeparateLanes",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FBALTest_Advanced_PureDataBranchesUseSeparateLanes::RunTest(const FString& /*Params*/)
+{
+	using namespace BALTest;
+
+	UEdGraph* Graph = MakeGraph();
+	UEdGraphNode* MainLeaf = MakeNode(Graph, false, 0, 1, -800, 0);
+	UEdGraphNode* Main = MakeNode(Graph, false, 1, 1, -400, 0);
+	UEdGraphNode* DetailLeaf = MakeNode(Graph, false, 0, 1, -800, 0);
+	UEdGraphNode* Detail = MakeNode(Graph, false, 1, 1, -400, 0);
+	UEdGraphNode* DirectLeaf = MakeNode(Graph, false, 0, 1, -800, 0);
+	UEdGraphNode* Sink = MakeNode(Graph, false, 3, 0, 0, 0);
+	WireData(MainLeaf, 0, Main, 0);
+	WireData(Main, 0, Sink, 0);
+	WireData(DetailLeaf, 0, Detail, 0);
+	WireData(Detail, 0, Sink, 1);
+	WireData(DirectLeaf, 0, Sink, 2);
+
+	FBALSettings Settings;
+	Settings.bPreserveAnchors = false;
+	TArray<FBALConstraint> Constraints;
+	FBALGraphAnalyzer::FAnalysisResult Analysis =
+		FBALGraphAnalyzer::Analyze(Graph, Settings, Constraints);
+	SolveAnalysis(Analysis, Settings, Constraints);
+
+	const FBALNode& MainLeafProxy = Analysis.Proxies.FindChecked(MainLeaf);
+	const FBALNode& MainProxy = Analysis.Proxies.FindChecked(Main);
+	const FBALNode& DetailLeafProxy = Analysis.Proxies.FindChecked(DetailLeaf);
+	const FBALNode& DetailProxy = Analysis.Proxies.FindChecked(Detail);
+	const FBALNode& DirectProxy = Analysis.Proxies.FindChecked(DirectLeaf);
+	const FBALNode& SinkProxy = Analysis.Proxies.FindChecked(Sink);
+
+	TestEqual(TEXT("Direct sink input uses the adjacent layer"), DirectProxy.Layer, SinkProxy.Layer - 1);
+	TestEqual(TEXT("Main branch terminal uses the adjacent layer"), MainProxy.Layer, SinkProxy.Layer - 1);
+	TestEqual(TEXT("Detail branch terminal uses the adjacent layer"), DetailProxy.Layer, SinkProxy.Layer - 1);
+
+	int32 SinkPrimaryRows = 0;
+	for (const FBALEdge& Edge : Analysis.Edges)
+	{
+		if (Edge.Kind == EBALEdgeKind::Data && Edge.Target == Sink && Edge.bPrimary)
+		{
+			++SinkPrimaryRows;
+		}
+	}
+	TestEqual(TEXT("Sink has exactly one same-row input"), SinkPrimaryRows, 1);
+
+	const float MainTop = FMath::Min(MainLeafProxy.OutPos.Y, MainProxy.OutPos.Y);
+	const float MainBottom = FMath::Max(
+		MainLeafProxy.OutPos.Y + MainLeafProxy.Size.Y,
+		MainProxy.OutPos.Y + MainProxy.Size.Y);
+	const float DetailTop = FMath::Min(DetailLeafProxy.OutPos.Y, DetailProxy.OutPos.Y);
+	const float DetailBottom = FMath::Max(
+		DetailLeafProxy.OutPos.Y + DetailLeafProxy.Size.Y,
+		DetailProxy.OutPos.Y + DetailProxy.Size.Y);
+	TestTrue(TEXT("Secondary branch starts below the primary branch envelope"),
+		DetailTop >= MainBottom + Settings.GapY - 0.01f);
+	TestTrue(TEXT("Third branch starts below the secondary branch envelope"),
+		DirectProxy.OutPos.Y >= DetailBottom + Settings.GapY - 0.01f);
+	TestFalse(TEXT("Primary and secondary terminals do not overlap"),
+		NodesOverlap(MainProxy, DetailProxy, Settings.NodeMargin));
+	TestFalse(TEXT("Secondary and direct terminals do not overlap"),
+		NodesOverlap(DetailProxy, DirectProxy, Settings.NodeMargin));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FBALTest_Advanced_PureDataSharedNodePrefersNearestConsumer,
+	"BlueprintAutoLayout.AdvancedRegression.Topology.PureDataSharedNodePrefersNearestConsumer",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FBALTest_Advanced_PureDataSharedNodePrefersNearestConsumer::RunTest(const FString& /*Params*/)
+{
+	using namespace BALTest;
+
+	UEdGraph* Graph = MakeGraph();
+	UEdGraphNode* Shared = MakeNode(Graph, false, 0, 1, -900, 0);
+	UEdGraphNode* Mid = MakeNode(Graph, false, 1, 1, -600, 0);
+	UEdGraphNode* Next = MakeNode(Graph, false, 1, 1, -300, 0);
+	UEdGraphNode* Sink = MakeNode(Graph, false, 2, 0, 0, 0);
+	WireData(Shared, 0, Mid, 0);
+	WireData(Mid, 0, Next, 0);
+	WireData(Next, 0, Sink, 0);
+	WireData(Shared, 0, Sink, 1);
+
+	FBALSettings Settings;
+	Settings.bPreserveAnchors = false;
+	TArray<FBALConstraint> Constraints;
+	FBALGraphAnalyzer::FAnalysisResult Analysis =
+		FBALGraphAnalyzer::Analyze(Graph, Settings, Constraints);
+	SolveAnalysis(Analysis, Settings, Constraints);
+
+	const FBALEdge* SharedToMid = Analysis.Edges.FindByPredicate(
+		[Shared, Mid](const FBALEdge& Edge)
+		{
+			return Edge.Kind == EBALEdgeKind::Data
+				&& Edge.Source == Shared && Edge.Target == Mid;
+		});
+	const FBALEdge* SharedToSink = Analysis.Edges.FindByPredicate(
+		[Shared, Sink](const FBALEdge& Edge)
+		{
+			return Edge.Kind == EBALEdgeKind::Data
+				&& Edge.Source == Shared && Edge.Target == Sink;
+		});
+	TestNotNull(TEXT("Shared-to-nearest edge exists"), SharedToMid);
+	TestNotNull(TEXT("Shared-to-sink edge exists"), SharedToSink);
+	if (SharedToMid && SharedToSink)
+	{
+		TestTrue(TEXT("Shared node belongs to its nearest downstream consumer"), SharedToMid->bPrimary);
+		TestFalse(TEXT("Long edge to sink remains a non-tree edge"), SharedToSink->bPrimary);
+	}
+	TestTrue(TEXT("Nearest-consumer branch stays on the same row"),
+		FMath::IsNearlyEqual(
+			Analysis.Proxies.FindChecked(Shared).OutPos.Y,
+			Analysis.Proxies.FindChecked(Mid).OutPos.Y,
+			0.01f));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FBALTest_Advanced_PureDataSharedDagIdempotence,
+	"BlueprintAutoLayout.AdvancedRegression.Topology.PureDataSharedDagIdempotence",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FBALTest_Advanced_PureDataSharedDagIdempotence::RunTest(const FString& /*Params*/)
+{
+	using namespace BALTest;
+
+	UEdGraph* Graph = MakeGraph();
+	UEdGraphNode* Shared = MakeNode(Graph, false, 0, 1, -600, 0);
+	UEdGraphNode* LowerStable = MakeNode(Graph, false, 1, 1, -300, 0);
+	UEdGraphNode* UpperByPin = MakeNode(Graph, false, 1, 1, -300, 0);
+	UEdGraphNode* Sink = MakeNode(Graph, false, 2, 0, 0, 0);
+	WireData(Shared, 0, LowerStable, 0);
+	WireData(Shared, 0, UpperByPin, 0);
+	WireData(UpperByPin, 0, Sink, 0);
+	WireData(LowerStable, 0, Sink, 1);
+
+	FBALSettings Settings;
+	Settings.bPreserveAnchors = true;
+	Settings.GridSnap = 8.f;
+	FBlueprintAutoLayoutEngine::Layout(Graph, Settings);
+
+	TMap<UEdGraphNode*, FIntPoint> FirstPositions;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (Node)
+		{
+			FirstPositions.Add(Node, FIntPoint(Node->NodePosX, Node->NodePosY));
+		}
+	}
+
+	FBlueprintAutoLayoutEngine::Layout(Graph, Settings);
+	bool bAllPositionsStable = true;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		const FIntPoint* First = FirstPositions.Find(Node);
+		if (Node && First
+			&& (Node->NodePosX != First->X || Node->NodePosY != First->Y))
+		{
+			bAllPositionsStable = false;
+			AddError(FString::Printf(
+				TEXT("Repeated shared-DAG layout moved node %d from (%d,%d) to (%d,%d)"),
+				Graph->Nodes.IndexOfByKey(Node), First->X, First->Y,
+				Node->NodePosX, Node->NodePosY));
+		}
+	}
+	TestTrue(TEXT("Shared data DAG is exactly position-idempotent"), bAllPositionsStable);
 
 	return true;
 }
