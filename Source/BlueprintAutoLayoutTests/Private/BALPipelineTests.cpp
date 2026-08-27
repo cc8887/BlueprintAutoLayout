@@ -14,6 +14,7 @@
 #include "BlueprintAutoLayoutEngine.h"
 #include "BALConstraintCollector.h"
 #include "BALGraphAnalyzer.h"
+#include "K2Node_Knot.h"
 #include "Misc/AutomationTest.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +149,77 @@ bool FBALTest_Pipeline_LinearChain::RunTest(const FString& /*Params*/)
 	    TEXT("Pure P1 pos=(%d,%d) P2 pos=(%d,%d)"),
 	    P1->NodePosX, P1->NodePosY, P2->NodePosX, P2->NodePosY));
 
+	return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FBALTest_Pipeline_SharedPureKnotTrack,
+	"BlueprintAutoLayout.Pipeline.SharedPureKnotTrack",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FBALTest_Pipeline_SharedPureKnotTrack::RunTest(const FString& /*Params*/)
+{
+	using namespace BALTest;
+
+	UEdGraph* G = MakeGraph();
+	UEdGraphNode* A = MakeNode(G, true, 1, 0, 0, 0);
+	UEdGraphNode* B = MakeNode(G, true, 1, 0, 600, 0);
+	UEdGraphNode* C = MakeNode(G, true, 1, 0, 1200, 0);
+	UEdGraphNode* Shared = MakeNode(G, false, 0, 1, -300, 300);
+	WireExec(A, B);
+	WireExec(B, C);
+	WireData(Shared, 0, A, 0);
+	WireData(Shared, 0, B, 0);
+	WireData(Shared, 0, C, 0);
+
+	FBALSettings S;
+	S.bForceDir = true;
+	S.ForcedDir = EBALPureDir::West;
+	S.KnotTrackMinSpan = 100.f;
+	S.KnotTrackDistanceThreshold = 300.f;
+	const TSet<UEdGraphNode*> FullSelection = { A, B, C, Shared };
+	FBlueprintAutoLayoutEngine::LayoutSelection(G, FullSelection, S);
+
+	auto CollectAutoKnotGuids = [G]()
+	{
+		TSet<FGuid> Result;
+		for (UEdGraphNode* Node : G->Nodes)
+		{
+			if (Node && Node->IsA<UK2Node_Knot>()
+				&& Node->NodeComment == TEXT("BlueprintAutoLayout.AutoTrack"))
+			{
+				Result.Add(Node->NodeGuid);
+			}
+		}
+		return Result;
+	};
+
+	const TSet<FGuid> FirstGuids = CollectAutoKnotGuids();
+	TestTrue(TEXT("Shared output creates a reroute track"), FirstGuids.Num() >= 2);
+
+	const FBALGraphAnalyzer::FAnalysisResult FirstAnalysis =
+		FBALGraphAnalyzer::Analyze(G, S, {});
+	int32 SharedLogicalLinks = 0;
+	for (const FBALEdge& Edge : FirstAnalysis.Edges)
+	{
+		if (Edge.Kind == EBALEdgeKind::Data && Edge.Source == Shared
+			&& (Edge.Target == A || Edge.Target == B || Edge.Target == C))
+		{
+			++SharedLogicalLinks;
+		}
+	}
+	TestEqual(TEXT("Reroutes preserve all logical consumers"), SharedLogicalLinks, 3);
+
+	FBlueprintAutoLayoutEngine::Layout(G, S);
+	const TSet<FGuid> SecondGuids = CollectAutoKnotGuids();
+	TestEqual(TEXT("Repeated layout keeps reroute count stable"), SecondGuids.Num(), FirstGuids.Num());
+	bool bSameGuids = SecondGuids.Num() == FirstGuids.Num();
+	for (const FGuid& Guid : FirstGuids)
+	{
+		bSameGuids = bSameGuids && SecondGuids.Contains(Guid);
+	}
+	TestTrue(TEXT("Repeated layout reuses reroute identities"), bSameGuids);
 	return true;
 }
 

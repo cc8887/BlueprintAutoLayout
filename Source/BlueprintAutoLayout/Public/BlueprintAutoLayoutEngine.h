@@ -34,5 +34,6 @@ public:
 private:
 	static void RunPipeline(UEdGraph* Graph,
 	                        TArray<FBALConstraint> Constraints,
-	                        const FBALSettings& Settings);
+	                        const FBALSettings& Settings,
+	                        bool bRouteSharedWires);
 };

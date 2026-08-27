@@ -13,8 +13,8 @@
  *   Barycentric sweeps reduce crossings and median pin alignment straightens wires.
  *
  * Pass 2 - Pure cluster layout:
- *   Each owned Pure group is layered outward from its consumer along PureDir.
- *   Multi-depth Pure chains are layered outward from the consumer.
+ *   Each owned Pure group is arranged outward from its consumer along PureDir.
+ *   West/East parameter depths are helixed into bounded-height columns.
  *
  * Pass 3 - Stable anchoring and component packing:
  *   Locked boundaries and component anchors stay stable while disconnected regions
@@ -58,6 +58,7 @@ private:
 	static void AlignLayers(TArray<TArray<FBALNode*>>& Layers,
 	                        const TArray<FBALEdge>& Edges,
 	                        const TMap<UEdGraphNode*, float>& ClusterHeights,
+	                        const TMap<UEdGraphNode*, float>& ClusterTopOffsets,
 	                        const FBALSettings& Settings);
 
 	static void PlacePureGroups(TMap<UEdGraphNode*, FBALNode>& Proxies,

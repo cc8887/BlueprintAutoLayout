@@ -171,10 +171,32 @@ struct FBALSettings
 	float GapX           = 32.f;
 	/** Vertical gap between branches at a fork. */
 	float GapY           = 48.f;
-	/** Additional horizontal gap between Pure depth layers. */
-	float PureGapX       = 8.f;
-	/** Vertical gap between parameter nodes in the same layer. */
-	float PureGapY       = 8.f;
+	/** Horizontal padding inside Pure parameter trees (Blueprint Assist default). */
+	float PureGapX       = 40.f;
+	/** Vertical padding inside Pure parameter trees (Blueprint Assist default). */
+	float PureGapY       = 25.f;
+	/** Extra clearance below the consumer's first execution input pin. */
+	float ParameterVerticalSpacing = 26.f;
+	/** Fold Pure dependency depths into vertical columns before growing farther outward. */
+	bool bHelixPureTrees = true;
+	/** Preferred maximum height of one helixed Pure parameter column. */
+	float PureHelixMaxHeight = 500.f;
+	/** Move Pure subtrees consumed by multiple Exec nodes into a shared lower lane. */
+	bool bSeparateSharedPureLanes = true;
+	/** Clearance between local parameter blocks and the shared Pure lane. */
+	float SharedPureLaneGap = 64.f;
+	/** Create Blueprint Assist-style reroute tracks for long shared Pure outputs. */
+	bool bCreateKnotTracks = true;
+	/** Vertical spacing between automatically generated wire tracks. */
+	float KnotTrackSpacing = 26.f;
+	/** Minimum horizontal span before a shared output is routed. */
+	float KnotTrackMinSpan = 200.f;
+	/** Blueprint Assist default distance at which even one link receives a track. */
+	float KnotTrackDistanceThreshold = 800.f;
+	/** Horizontal offset between a pin and its first/last reroute node. */
+	float KnotTrackXOffset = 20.f;
+	/** Merge drops which would produce nearly coincident reroute nodes. */
+	float KnotTrackMergeDistance = 50.f;
 	/** Per-node collision margin (added to AABB on all sides). */
 	float NodeMargin     = 8.f;
 	/** Grid snap size for final coordinates (0 = no snap). */

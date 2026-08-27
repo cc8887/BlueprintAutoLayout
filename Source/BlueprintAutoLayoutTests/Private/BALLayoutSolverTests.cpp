@@ -170,6 +170,11 @@ bool FBALTest_PureGroupWest::RunTest(const FString& /*Params*/)
 	TestTrue(TEXT("Pure right edge <= Exec left edge"),
 	         PureRight <= EP.X + 0.1f);
 
+	// Blueprint Assist keeps parameter trees below the execution pin baseline so
+	// data wires do not run through the main white execution spine.
+	TestTrue(TEXT("Pure parameter tree starts below the exec node top"),
+	         PP.Y > EP.Y);
+
 	return true;
 }
 
@@ -272,9 +277,9 @@ bool FBALTest_PureDepthLayering::RunTest(const FString& /*Params*/)
 {
 	using namespace BALTest;
 
-	// P2 → P1 → Exec (depth 0 = P1, depth 1 = P2)
-	// With West direction: depth 0 should be closer to Exec.X,
-	// depth 1 should be further left.
+	// P2 -> P1 -> Exec (depth 0 = P1, depth 1 = P2).
+	// Blueprint Assist-style helixing keeps consecutive shallow depths in one
+	// bounded-height column instead of stretching the chain across the graph.
 	UEdGraph* G = MakeGraph();
 	UEdGraphNode* Exec = MakeNode(G, true,  1, 0, 600, 0);
 	UEdGraphNode* P1   = MakeNode(G, false, 1, 1, 300, 0);
@@ -293,8 +298,49 @@ bool FBALTest_PureDepthLayering::RunTest(const FString& /*Params*/)
 	// P1 (depth 0) is directly left of Exec
 	TestTrue(TEXT("P1 left of Exec"), PP1.OutPos.X < EP.OutPos.X);
 
-	// P2 (depth 1) is even further left
-	TestTrue(TEXT("P2 left of P1"), PP2.OutPos.X < PP1.OutPos.X);
+	TestTrue(TEXT("P2 shares P1 parameter column"),
+		FMath::IsNearlyEqual(PP2.OutPos.X, PP1.OutPos.X, 0.01f));
+	TestTrue(TEXT("P2 is stacked below P1"),
+		PP2.OutPos.Y >= PP1.OutPos.Y + PP1.Size.Y + S.PureGapY - 0.01f);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FBALTest_SharedPureLowerLane,
+	"BlueprintAutoLayout.LayoutSolver.SharedPureLowerLane",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FBALTest_SharedPureLowerLane::RunTest(const FString& /*Params*/)
+{
+	using namespace BALTest;
+
+	UEdGraph* G = MakeGraph();
+	UEdGraphNode* ExecA = MakeNode(G, true, 2, 0, 0, 0);
+	UEdGraphNode* ExecB = MakeNode(G, true, 2, 0, 600, 0);
+	UEdGraphNode* Shared = MakeNode(G, false, 0, 2, 200, 0);
+	UEdGraphNode* PrivateA = MakeNode(G, false, 0, 1, 100, 200);
+	UEdGraphNode* PrivateB = MakeNode(G, false, 0, 1, 500, 200);
+	WireExec(ExecA, ExecB);
+	WireData(Shared, 0, ExecA, 0);
+	WireData(Shared, 1, ExecB, 0);
+	WireData(PrivateA, 0, ExecA, 1);
+	WireData(PrivateB, 0, ExecB, 1);
+
+	FBALSettings S;
+	FBALGraphAnalyzer::FAnalysisResult R;
+	SolveGraph(G, EBALPureDir::West, S, R);
+
+	const FBALNode& SharedNode = R.Proxies[Shared];
+	float LocalBottom = -MAX_flt;
+	for (UEdGraphNode* Local : { ExecA, ExecB, PrivateA, PrivateB })
+	{
+		const FBALNode& Node = R.Proxies[Local];
+		LocalBottom = FMath::Max(LocalBottom, Node.OutPos.Y + Node.Size.Y);
+	}
+	const float LaneGap = FMath::Max(S.SharedPureLaneGap, S.GapY);
+	TestTrue(TEXT("Shared Pure subtree starts below all local parameter blocks"),
+		SharedNode.OutPos.Y >= LocalBottom + LaneGap - 0.01f);
 
 	return true;
 }

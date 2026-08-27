@@ -116,7 +116,7 @@ bool FBALTest_PureGroupScale_ManySparseOwners::RunTest(const FString& /*Params*/
 	const float HorizontalGap = FMath::Max(Settings.GapX, Settings.NodeMargin * 2.f);
 	int32 FiniteCount = 0;
 	int32 SeparatedCount = 0;
-	int32 CenteredCount = 0;
+	int32 BelowExecCount = 0;
 	for (int32 Index = 0; Index < ConsumerCount; ++Index)
 	{
 		const FBALNode& Consumer = Proxies.FindChecked(Consumers[Index]);
@@ -130,16 +130,14 @@ bool FBALTest_PureGroupScale_ManySparseOwners::RunTest(const FString& /*Params*/
 		{
 			++SeparatedCount;
 		}
-		const float ConsumerCenterY = Consumer.OutPos.Y + Consumer.Size.Y * 0.5f;
-		const float PureCenterY = Pure.OutPos.Y + Pure.Size.Y * 0.5f;
-		if (FMath::IsNearlyEqual(ConsumerCenterY, PureCenterY, 0.01f))
+		if (Pure.OutPos.Y > Consumer.OutPos.Y)
 		{
-			++CenteredCount;
+			++BelowExecCount;
 		}
 	}
 	TestEqual(TEXT("Every sparse owner pair receives finite coordinates"), FiniteCount, ConsumerCount);
 	TestEqual(TEXT("Every sparse pure remains west of its own consumer"), SeparatedCount, ConsumerCount);
-	TestEqual(TEXT("Every one-node pure group remains centered on its consumer"), CenteredCount, ConsumerCount);
+	TestEqual(TEXT("Every one-node pure group starts below its consumer's exec spine"), BelowExecCount, ConsumerCount);
 	return true;
 }
 
@@ -200,11 +198,12 @@ bool FBALTest_PureGroupScale_DeepSingleOwner::RunTest(const FString& /*Params*/)
 	SolvePureScaleGraph(Proxies, Edges, Components, Settings);
 
 	int32 FiniteCount = 0;
-	int32 CenteredCount = 0;
-	int32 SeparatedDepthCount = 0;
+	int32 BelowExecCount = 0;
+	int32 HelixedDepthCount = 0;
+	int32 WrappedDepthCount = 0;
 	const FBALNode& SolvedConsumer = Proxies.FindChecked(Consumer);
-	const float ConsumerCenterY = SolvedConsumer.OutPos.Y + SolvedConsumer.Size.Y * 0.5f;
 	const float LayerGap = FMath::Max(Settings.PureGapX, Settings.NodeMargin * 2.f);
+	const float VerticalGap = FMath::Max(Settings.PureGapY, Settings.NodeMargin * 2.f);
 	for (int32 Depth = 0; Depth < DepthCount; ++Depth)
 	{
 		const FBALNode& Pure = Proxies.FindChecked(PuresByDepth[Depth]);
@@ -212,21 +211,29 @@ bool FBALTest_PureGroupScale_DeepSingleOwner::RunTest(const FString& /*Params*/)
 		{
 			++FiniteCount;
 		}
-		if (FMath::IsNearlyEqual(Pure.OutPos.Y + Pure.Size.Y * 0.5f, ConsumerCenterY, 0.01f))
+		if (Pure.OutPos.Y > SolvedConsumer.OutPos.Y)
 		{
-			++CenteredCount;
+			++BelowExecCount;
 		}
 		if (Depth > 0)
 		{
 			const FBALNode& Shallower = Proxies.FindChecked(PuresByDepth[Depth - 1]);
-			if (Pure.OutPos.X + Pure.Size.X + LayerGap <= Shallower.OutPos.X + 0.01f)
+			if (FMath::IsNearlyEqual(Pure.OutPos.X, Shallower.OutPos.X, 0.01f)
+				&& Pure.OutPos.Y >= Shallower.OutPos.Y + Shallower.Size.Y + VerticalGap - 0.01f)
 			{
-				++SeparatedDepthCount;
+				++HelixedDepthCount;
+			}
+			else if (Pure.OutPos.X + Pure.Size.X + LayerGap <= Shallower.OutPos.X + 0.01f)
+			{
+				++WrappedDepthCount;
 			}
 		}
 	}
 	TestEqual(TEXT("Every deep pure receives finite coordinates"), FiniteCount, DepthCount);
-	TestEqual(TEXT("Every deep pure is consumed by the depth cursor"), CenteredCount, DepthCount);
-	TestEqual(TEXT("Every deeper layer is strictly farther west"), SeparatedDepthCount, DepthCount - 1);
+	TestEqual(TEXT("Every deep pure remains below the consumer's exec spine"), BelowExecCount, DepthCount);
+	TestEqual(TEXT("Every depth either stacks or wraps west"),
+		HelixedDepthCount + WrappedDepthCount, DepthCount - 1);
+	TestTrue(TEXT("Deep chains use vertical helixing"), HelixedDepthCount > 0);
+	TestTrue(TEXT("Deep chains wrap into additional west columns"), WrappedDepthCount > 0);
 	return true;
 }
